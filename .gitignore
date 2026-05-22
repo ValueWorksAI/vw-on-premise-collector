@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+output/
+logs/
+*.parquet
+*.jsonl
+.idea/
+.vscode/
+dist/
+build/
+*.egg-info/
+
+# --- Customer-specific source folders are NEVER committed ---
+# Only the framework + _example/ template live in this repo.
+# Real customer sources stay on the customer PC.
+sources/*/
+!sources/_example/
+!sources/.gitkeep

@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "vw-on-prem-collector"
+version = "0.1.0"
+description = "Generic on-premise data collector framework. Each data source is a self-contained 'push' under sources/. The orchestrator runs them sequentially or in parallel and uploads results to Azure Blob Storage."
+authors = ["ValueWorks"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+# pyarrow currently has no wheels for Python 3.14; pin to <3.13 for safety.
+python = ">=3.10,<3.13"
+requests = "^2.31"
+pandas = "^2.2"
+pyarrow = "^16.0"
+pyyaml = "^6.0"
+python-dotenv = "^1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -1,0 +1,28 @@
+# Template for a new source. Copy this folder to sources/<your-source>/ and edit.
+name: example
+output_dir: C:\output\example
+max_workers: 5
+
+azure:
+  storage_url: ${env:AZURE_STORAGE_URL}
+  sas_token:   ${env:AZURE_STORAGE_SAS_TOKEN}
+  container:   warehouse
+  prefix:      raw/example
+
+# Optional: partition keys (e.g. company IDs, tenant IDs) iterated per object.
+# Leave empty for single-shot fetches.
+partition_field: companyId
+partitions: []
+
+# Connection block is free-form; your push.py parses it.
+connection:
+  base_url: https://example.local/api
+  username: ${env:EXAMPLE_USERNAME}
+  password: ${env:EXAMPLE_PASSWORD}
+  verify_ssl: false
+
+objects:
+  - name: SomeObject
+    endpoint: v1/SomeObject
+    timestamp_field: lastChange   # null => always full refresh
+    partition_scoped: true
