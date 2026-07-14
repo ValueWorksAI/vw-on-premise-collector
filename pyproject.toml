@@ -7,20 +7,22 @@ readme = "README.md"
 package-mode = false
 
 [tool.poetry.dependencies]
-# pyarrow currently has no wheels for Python 3.14; pin to <3.13 for safety.
-python = ">=3.10,<3.13"
+python = ">=3.10,<3.15"
 requests = "^2.31"
 pandas = "^2.2"
-pyarrow = "^16.0"
+# Wide range: old pythons resolve pyarrow 16.x, Python 3.13/3.14 need >=18/>=25.
+pyarrow = ">=16.0,<26"
 pyyaml = "^6.0"
 python-dotenv = "^1.0"
 
-# Only needed for MSSQL sources (requires the Microsoft ODBC driver on the host):
-#   poetry install --with mssql
+# Only needed for MSSQL sources: poetry install --with mssql
+# pymssql is self-contained (bundles FreeTDS); pyodbc additionally requires
+# the Microsoft ODBC driver (msodbcsql18) on the host.
 [tool.poetry.group.mssql]
 optional = true
 
 [tool.poetry.group.mssql.dependencies]
+pymssql = "^2.3"
 pyodbc = "^5.1"
 
 [build-system]

@@ -12,6 +12,11 @@ dist/
 build/
 *.egg-info/
 
+# Customer deliverables & local helper scripts (repo is public — keep customer
+# names/accounts out of it)
+*.zip
+scripts/
+
 # --- Customer-specific source folders are NEVER committed ---
 # Only the framework + _example*/ templates live in this repo.
 # Real customer sources stay on the customer PC.

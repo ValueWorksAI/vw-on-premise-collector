@@ -17,14 +17,18 @@ partition_field: null
 partitions: []
 
 connection:
-  driver: ODBC Driver 18 for SQL Server
+  # pymssql (default): self-contained wheel, no system packages needed.
+  # pyodbc: requires msodbcsql18 on the host; also honors driver/encrypt/
+  # trust_server_certificate below.
+  library: pymssql
   host: ${env:EXAMPLE_MSSQL_HOST}
   port: 1433
   database: ${env:EXAMPLE_MSSQL_DATABASE}
   username: ${env:EXAMPLE_MSSQL_USERNAME}
   password: ${env:EXAMPLE_MSSQL_PASSWORD}
+  # pyodbc-only settings:
+  driver: ODBC Driver 18 for SQL Server
   encrypt: true
-  # Set to true when the SQL Server uses a self-signed certificate:
   trust_server_certificate: true
 
 objects:

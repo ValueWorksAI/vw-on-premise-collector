@@ -21,7 +21,7 @@ Customer-specific source folders are never committed to this repo — only the f
 
 ## Setup — Windows
 
-1. Install Python 3.10–3.12 (pyarrow has no 3.13/3.14 wheels yet).
+1. Install Python 3.10–3.14.
 2. Install Poetry: `pip install poetry`
 3. Install AzCopy v10 — required for uploads.
    - Download: <https://aka.ms/downloadazcopy-v10-windows>
@@ -33,11 +33,11 @@ Customer-specific source folders are never committed to this repo — only the f
 
 ## Setup — Ubuntu / Linux
 
-1. Install Python 3.10–3.12 and Poetry:
+1. Install Python 3.10–3.14 and Poetry (via pipx — recent Ubuntu blocks pip installs into the system Python):
 
    ```bash
-   sudo apt-get install -y python3 python3-pip
-   pip install poetry
+   sudo apt-get install -y python3 python3-venv pipx
+   pipx install poetry && pipx ensurepath
    ```
 
 2. Install AzCopy v10:
@@ -48,7 +48,10 @@ Customer-specific source folders are never committed to this repo — only the f
 
    (`azcopy` on PATH is picked up automatically; otherwise set `AZCOPY_PATH` in `.env`.)
 
-3. **MSSQL sources only** — install the Microsoft ODBC driver:
+3. **MSSQL sources with `library: pyodbc` only** — install the Microsoft ODBC driver
+   (not needed for the default `library: pymssql`, whose wheel bundles FreeTDS —
+   use pymssql on distros where `msodbcsql18` is not yet available, e.g. brand-new
+   Ubuntu releases):
 
    ```bash
    curl -sSL -O https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb
