@@ -1,0 +1,74 @@
+"""Microsoft SQL Server source template. Copy to sources/<your-source>/ and edit config.yaml.
+
+Requires the `mssql` dependency group (pyodbc) plus the Microsoft ODBC driver:
+  poetry install --with mssql
+
+`endpoint` in config.yaml is the schema-qualified table/view name; the optional
+`extra.columns` list restricts the SELECT to specific columns. `timestamp_field`
+must be a datetime column that is updated on every row change (enables delta
+refresh); leave it null for tables without one — they full-refresh every run.
+"""
+from __future__ import annotations
+
+from typing import Any, Iterable
+
+from common.config import ObjectSpec
+from common.source import Source
+
+FETCH_BATCH_SIZE = 10_000
+
+
+class MSSQLSource(Source):
+    def authenticate(self) -> None:
+        import pyodbc  # deferred import: only needed when an MSSQL source is configured
+
+        c = self.config.connection
+        parts = [
+            f"DRIVER={{{c.get('driver', 'ODBC Driver 18 for SQL Server')}}}",
+            f"SERVER={c['host']},{c.get('port', 1433)}",
+            f"DATABASE={c['database']}",
+            f"UID={c['username']}",
+            f"PWD={c['password']}",
+            f"Encrypt={'yes' if c.get('encrypt', True) else 'no'}",
+        ]
+        if c.get("trust_server_certificate", False):
+            parts.append("TrustServerCertificate=yes")
+        self.conn = pyodbc.connect(";".join(parts), timeout=int(c.get("login_timeout", 30)))
+
+    def build_filter(self, obj: ObjectSpec, partition: Any | None,
+                     lower: str | None, upper: str | None) -> tuple[str, list[Any]]:
+        """Return (where_sql, params) — always parameterized, never inlined values."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if obj.timestamp_field and lower:
+            clauses.append(f"[{obj.timestamp_field}] > ? AND [{obj.timestamp_field}] <= ?")
+            params += [lower, upper]
+        if partition is not None and self.config.partition_field:
+            clauses.append(f"[{self.config.partition_field}] = ?")
+            params.append(partition)
+        return " AND ".join(clauses), params
+
+    def fetch(self, obj: ObjectSpec, partition: Any | None,
+              filter_: tuple[str, list[Any]]) -> Iterable[dict]:
+        where, params = filter_
+        columns = obj.extra.get("columns")
+        select = ", ".join(f"[{c}]" for c in columns) if columns else "*"
+        sql = f"SELECT {select} FROM {obj.endpoint}"
+        if where:
+            sql += f" WHERE {where}"
+
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(sql, params)
+            col_names = [d[0] for d in cursor.description]
+            while True:
+                rows = cursor.fetchmany(FETCH_BATCH_SIZE)
+                if not rows:
+                    break
+                for row in rows:
+                    yield dict(zip(col_names, row))
+        finally:
+            cursor.close()
+
+
+SOURCE_CLASS = MSSQLSource

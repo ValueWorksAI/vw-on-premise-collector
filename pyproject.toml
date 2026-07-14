@@ -15,6 +15,14 @@ pyarrow = "^16.0"
 pyyaml = "^6.0"
 python-dotenv = "^1.0"
 
+# Only needed for MSSQL sources (requires the Microsoft ODBC driver on the host):
+#   poetry install --with mssql
+[tool.poetry.group.mssql]
+optional = true
+
+[tool.poetry.group.mssql.dependencies]
+pyodbc = "^5.1"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"

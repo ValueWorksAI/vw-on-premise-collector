@@ -13,8 +13,9 @@ build/
 *.egg-info/
 
 # --- Customer-specific source folders are NEVER committed ---
-# Only the framework + _example/ template live in this repo.
+# Only the framework + _example*/ templates live in this repo.
 # Real customer sources stay on the customer PC.
 sources/*/
 !sources/_example/
+!sources/_example_mssql/
 !sources/.gitkeep

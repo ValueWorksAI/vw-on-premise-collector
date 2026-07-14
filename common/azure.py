@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -16,12 +17,13 @@ log = logging.getLogger(__name__)
 
 
 def _azcopy() -> str:
-    return os.getenv("AZCOPY_PATH", r"C:\AzCopy\azcopy.exe")
+    default = r"C:\AzCopy\azcopy.exe" if os.name == "nt" else "azcopy"
+    return os.getenv("AZCOPY_PATH", default)
 
 
 def ensure_azcopy() -> None:
     path = _azcopy()
-    if not Path(path).exists():
+    if not Path(path).exists() and shutil.which(path) is None:
         raise FileNotFoundError(f"AzCopy not found at {path} (set AZCOPY_PATH)")
 
 

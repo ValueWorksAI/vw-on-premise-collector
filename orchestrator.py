@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,7 +19,16 @@ from common.azure import ensure_azcopy
 
 REPO_ROOT = Path(__file__).resolve().parent
 SOURCES_DIR = REPO_ROOT / "sources"
-LOG_DIR = Path(r"C:\logs\vw-on-prem-collector")
+
+
+def log_dir() -> Path:
+    """Resolved lazily so VW_LOG_DIR from .env (loaded in main) is honored."""
+    env = os.getenv("VW_LOG_DIR")
+    if env:
+        return Path(env)
+    if os.name == "nt":
+        return Path(r"C:\logs\vw-on-prem-collector")
+    return REPO_ROOT / "logs"
 
 
 def discover_sources() -> list[Path]:
@@ -48,7 +58,7 @@ def run_in_process(source_name: str, mode: str) -> int:
     from common.source import load_source
 
     src_dir = SOURCES_DIR / source_name
-    setup_logging(source_name, LOG_DIR / source_name)
+    setup_logging(source_name, log_dir() / source_name)
     log = logging.getLogger("orchestrator")
     try:
         source = load_source(src_dir, mode)
@@ -72,15 +82,16 @@ def main() -> int:
     if args.run_source:
         return run_in_process(args.run_source, args.mode)
 
-    setup_logging("orchestrator", LOG_DIR)
+    setup_logging("orchestrator", log_dir())
     log = logging.getLogger("orchestrator")
 
     try:
         ensure_azcopy()
     except FileNotFoundError as e:
         log.error(str(e))
-        log.error("Install AzCopy from https://aka.ms/downloadazcopy-v10-windows "
-                  "and set AZCOPY_PATH in .env (default: C:\\AzCopy\\azcopy.exe)")
+        log.error("Install AzCopy v10 (Windows: https://aka.ms/downloadazcopy-v10-windows, "
+                  "Linux: https://aka.ms/downloadazcopy-v10-linux) and set AZCOPY_PATH in .env "
+                  "if it is not on PATH")
         return 2
 
     discovered = discover_sources()

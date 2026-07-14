@@ -1,0 +1,39 @@
+# Template for an on-premise Microsoft SQL Server source.
+# Copy this folder to sources/<your-source>/ and edit.
+# Requires the mssql dependency group: poetry install --with mssql
+name: example-mssql
+output_dir: /var/opt/vw-on-prem-collector/output   # Windows: C:\output\example-mssql
+max_workers: 1
+
+azure:
+  storage_url: ${env:AZURE_STORAGE_URL}
+  sas_token:   ${env:AZURE_STORAGE_SAS_TOKEN}
+  container:   warehouse
+  prefix:      raw/example-mssql
+
+# Optional: partition keys (e.g. company IDs) iterated per object.
+# Leave empty for single-shot fetches.
+partition_field: null
+partitions: []
+
+connection:
+  driver: ODBC Driver 18 for SQL Server
+  host: ${env:EXAMPLE_MSSQL_HOST}
+  port: 1433
+  database: ${env:EXAMPLE_MSSQL_DATABASE}
+  username: ${env:EXAMPLE_MSSQL_USERNAME}
+  password: ${env:EXAMPLE_MSSQL_PASSWORD}
+  encrypt: true
+  # Set to true when the SQL Server uses a self-signed certificate:
+  trust_server_certificate: true
+
+objects:
+  - name: SomeTable
+    endpoint: dbo.SomeTable        # schema-qualified table or view
+    timestamp_field: ModifiedAt    # datetime column for delta refresh; null => always full refresh
+    partition_scoped: false
+    extra:
+      columns:                     # omit `columns` entirely for SELECT *
+        - Id
+        - ModifiedAt
+        - Amount
