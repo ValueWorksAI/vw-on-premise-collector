@@ -113,6 +113,31 @@ poetry run python orchestrator.py --mode full --sources mysource
 poetry run python orchestrator.py --mode delta --parallel --max-workers 3
 ```
 
+## Onboarding a new customer machine
+
+Send the IT preparation guide to the customer's IT ahead of time — it lists the host
+requirements, the read-only SQL login script, and the firewall/proxy questions.
+Available in [German](docs/onboarding-it-admin.de.md) and
+[English](docs/onboarding-it-admin.en.md); keep both in sync when editing.
+Then, on the machine, in this order:
+
+```bash
+# 1. Is the SAS token right? (scope, permissions, expiry, List/Write/Read, real AzCopy upload)
+poetry run python tools/check_azure.py --container warehouse --prefix raw/<name>
+
+# 2. What does the source database look like? Writes a JSON dump to send back.
+poetry run python tools/probe_mssql.py --host <server> --database <db> \
+    --user vw_readonly --sample --emit-config --out <name>-schema.json
+
+# 2b. If the product's database engine is unknown, this needs no connection at all:
+poetry run python tools/probe_mssql.py --drivers
+```
+
+Run `check_azure.py` **first** — it surfaces proxy and TLS-interception problems, which are
+the most common cause of a failing install, before any database work. The schema dump from
+step 2 is enough to author `config.yaml` offline, so source selection does not need another
+session with the customer.
+
 ## Adding a new source
 
 1. Copy `sources/_example/` (HTTP/API) or `sources/_example_mssql/` (SQL Server) to `sources/<name>/`.

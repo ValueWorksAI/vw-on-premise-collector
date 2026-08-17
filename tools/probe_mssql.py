@@ -1,0 +1,264 @@
+"""Dump a SQL Server schema to JSON so a source's config.yaml can be written offline.
+
+Read-only. Row counts come from sys.partitions metadata (no COUNT(*) scans), so it
+is safe to run against a production instance. Only objects the login can actually
+see are listed — which makes this a permission check as well as a schema dump.
+
+Run it on the customer machine, hand back the JSON, and the objects: block for
+config.yaml can be generated without further access.
+
+Usage:
+  # Which database engines does this machine even have drivers for? (no connection)
+  poetry run python tools/probe_mssql.py --drivers
+
+  # Schema dump
+  poetry run python tools/probe_mssql.py --host abasbi1 --database abas_bi \
+      --user vw_readonly --out abasbi1-schema.json
+
+  # ...plus the actual date range of each delta candidate column (runs MIN/MAX queries)
+  poetry run python tools/probe_mssql.py --host abasbi1 --database abas_bi \
+      --user vw_readonly --sample --out abasbi1-schema.json
+
+Password comes from --password, else the MSSQL_PASSWORD env var, else a prompt.
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+# Types usable as `timestamp_field` (the collector filters with `col > ? AND col <= ?`).
+DELTA_TYPES = {"datetime", "datetime2", "smalldatetime", "datetimeoffset", "date"}
+# Changes on every row update but cannot be compared to a timestamp — needs custom code.
+ROWVERSION_TYPES = {"timestamp", "rowversion"}
+# Column-name fragments that suggest a last-changed column, best first.
+NAME_HINTS = ("lastchange", "last_change", "lastmodif", "modified", "changed", "updated",
+              "aenderung", "geaendert", "letzteaenderung", "mutation", "changedate",
+              "updatedat", "modifiedat", "timestamp", "chgdate")
+
+
+def list_drivers() -> int:
+    """Print installed ODBC drivers — tells you what a mystery product runs on."""
+    try:
+        import pyodbc
+    except ImportError:
+        print("pyodbc is not installed. Run: poetry install --with mssql")
+        return 2
+    drivers = pyodbc.drivers()
+    if not drivers:
+        print("No ODBC drivers installed.")
+        return 1
+    print(f"{len(drivers)} ODBC driver(s) installed on this machine:\n")
+    for d in drivers:
+        low = d.lower()
+        tag = ""
+        if "sql server" in low:
+            tag = "  <- Microsoft SQL Server: use library pymssql or pyodbc"
+        elif any(k in low for k in ("pervasive", "btrieve", "advantage", "actian")):
+            tag = "  <- Pervasive/Btrieve/Advantage: needs a generic-ODBC source, not the MSSQL template"
+        elif "mysql" in low or "mariadb" in low:
+            tag = "  <- MySQL/MariaDB: needs a generic-ODBC source"
+        elif "oracle" in low:
+            tag = "  <- Oracle: needs a generic-ODBC source"
+        print(f"  - {d}{tag}")
+    return 0
+
+
+def connect(args: argparse.Namespace, password: str):
+    """Same connection logic as sources/_example_mssql/push.py."""
+    if args.library == "pymssql":
+        import pymssql
+
+        return pymssql.connect(server=args.host, port=int(args.port), database=args.database,
+                               user=args.user, password=password, login_timeout=args.login_timeout)
+    import pyodbc
+
+    parts = [f"DRIVER={{{args.driver}}}", f"SERVER={args.host},{args.port}",
+             f"DATABASE={args.database}", f"UID={args.user}", f"PWD={password}",
+             "Encrypt=yes" if args.encrypt else "Encrypt=no"]
+    if args.trust_server_certificate:
+        parts.append("TrustServerCertificate=yes")
+    return pyodbc.connect(";".join(parts), timeout=args.login_timeout)
+
+
+def _rows(conn, sql: str, params: tuple = ()) -> list[tuple]:
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, params) if params else cur.execute(sql)
+        return cur.fetchall()
+    finally:
+        cur.close()
+
+
+def rank_delta_candidates(columns: list[dict]) -> list[str]:
+    """Usable delta columns, most likely first (name hint beats declaration order)."""
+    usable = [c for c in columns if c["data_type"].lower() in DELTA_TYPES]
+
+    def score(col: dict) -> tuple[int, int]:
+        low = col["name"].lower().replace("_", "")
+        for i, hint in enumerate(NAME_HINTS):
+            if hint.replace("_", "") in low:
+                return (i, col["position"])
+        return (len(NAME_HINTS), col["position"])
+
+    return [c["name"] for c in sorted(usable, key=score)]
+
+
+def probe(conn, args: argparse.Namespace) -> dict:
+    server_info = _rows(conn, "SELECT @@VERSION, DB_NAME(), SUSER_NAME(), "
+                              "CAST(SERVERPROPERTY('Collation') AS nvarchar(128))")[0]
+    result: dict = {
+        "server_version": str(server_info[0]).split("\n")[0].strip(),
+        "database": server_info[1],
+        "login": server_info[2],
+        "collation": server_info[3],
+        "objects": [],
+    }
+
+    objects: dict[tuple[str, str], dict] = {}
+    for schema, name, rowcount in _rows(conn, """
+        SELECT s.name, t.name, SUM(p.rows)
+        FROM sys.tables t
+        JOIN sys.schemas s ON s.schema_id = t.schema_id
+        JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1)
+        GROUP BY s.name, t.name
+    """):
+        objects[(schema, name)] = {"schema": schema, "name": name, "type": "TABLE",
+                                   "row_count": int(rowcount or 0), "columns": []}
+    for schema, name in _rows(conn, """
+        SELECT s.name, v.name FROM sys.views v
+        JOIN sys.schemas s ON s.schema_id = v.schema_id
+    """):
+        objects[(schema, name)] = {"schema": schema, "name": name, "type": "VIEW",
+                                   "row_count": None, "columns": []}
+
+    for schema, table, col, dtype, nullable, maxlen, pos in _rows(conn, """
+        SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE,
+               CHARACTER_MAXIMUM_LENGTH, ORDINAL_POSITION
+        FROM INFORMATION_SCHEMA.COLUMNS
+        ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+    """):
+        obj = objects.get((schema, table))
+        if obj is not None:
+            obj["columns"].append({"name": col, "data_type": dtype, "nullable": nullable == "YES",
+                                   "max_length": maxlen, "position": pos})
+
+    selected = [
+        o for o in objects.values()
+        if not args.include or args.include.lower() in f"{o['schema']}.{o['name']}".lower()
+    ]
+    for obj in selected:
+        obj["delta_candidates"] = rank_delta_candidates(obj["columns"])
+        obj["rowversion_columns"] = [c["name"] for c in obj["columns"]
+                                     if c["data_type"].lower() in ROWVERSION_TYPES]
+        if args.sample and obj["type"] == "TABLE" and obj["delta_candidates"] and obj["row_count"]:
+            col = obj["delta_candidates"][0]
+            try:
+                lo, hi = _rows(conn, f"SELECT MIN([{col}]), MAX([{col}]) "
+                                     f"FROM [{obj['schema']}].[{obj['name']}]")[0]
+                obj["delta_sample"] = {"column": col, "min": str(lo), "max": str(hi)}
+            except Exception as e:  # noqa: BLE001
+                obj["delta_sample"] = {"column": col, "error": f"{type(e).__name__}: {e}"}
+
+    result["objects"] = sorted(selected, key=lambda o: (o["schema"], o["name"]))
+    return result
+
+
+def print_summary(data: dict) -> None:
+    objects = data["objects"]
+    tables = [o for o in objects if o["type"] == "TABLE"]
+    print(f"\nServer:    {data['server_version']}")
+    print(f"Database:  {data['database']}  (login: {data['login']})")
+    print(f"Visible:   {len(tables)} tables, {len(objects) - len(tables)} views\n")
+
+    print(f"{'OBJECT':<50} {'ROWS':>12}  DELTA CANDIDATE")
+    print("-" * 90)
+    for o in sorted(objects, key=lambda x: -(x["row_count"] or 0)):
+        rows = f"{o['row_count']:,}" if o["row_count"] is not None else "(view)"
+        candidate = o["delta_candidates"][0] if o["delta_candidates"] else "-- none, full refresh"
+        sample = o.get("delta_sample", {})
+        if sample.get("max"):
+            candidate += f"  (max {sample['max'][:19]})"
+        print(f"{o['schema'] + '.' + o['name']:<50} {rows:>12}  {candidate}")
+        if o["rowversion_columns"] and not o["delta_candidates"]:
+            print(f"{'':<50} {'':>12}  has rowversion {o['rowversion_columns']} — custom delta possible")
+
+
+def emit_config(data: dict, min_rows: int) -> None:
+    print("\n# --- draft objects: block for config.yaml (review before use) ---")
+    print("objects:")
+    for o in data["objects"]:
+        if o["type"] == "TABLE" and (o["row_count"] or 0) < min_rows:
+            continue
+        ts = o["delta_candidates"][0] if o["delta_candidates"] else None
+        print(f"  - name: {o['name']}")
+        print(f"    endpoint: {o['schema']}.{o['name']}")
+        print(f"    timestamp_field: {ts if ts else 'null'}"
+              + ("" if ts else "   # no datetime column -> full refresh every run"))
+        print("    partition_scoped: false")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Dump a SQL Server schema for config.yaml authoring")
+    parser.add_argument("--drivers", action="store_true",
+                        help="List installed ODBC drivers and exit (no connection needed)")
+    parser.add_argument("--host")
+    parser.add_argument("--port", default=1433)
+    parser.add_argument("--database")
+    parser.add_argument("--user")
+    parser.add_argument("--password", help="Omit to read MSSQL_PASSWORD or prompt")
+    parser.add_argument("--library", choices=["pymssql", "pyodbc"], default="pymssql")
+    parser.add_argument("--driver", default="ODBC Driver 18 for SQL Server", help="pyodbc only")
+    parser.add_argument("--encrypt", action="store_true", default=True, help="pyodbc only")
+    parser.add_argument("--trust-server-certificate", action="store_true", help="pyodbc only")
+    parser.add_argument("--login-timeout", type=int, default=30)
+    parser.add_argument("--include", help="Only objects whose schema.name contains this substring")
+    parser.add_argument("--sample", action="store_true",
+                        help="Also query MIN/MAX of each table's top delta candidate")
+    parser.add_argument("--emit-config", action="store_true", help="Print a draft objects: block")
+    parser.add_argument("--min-rows", type=int, default=1,
+                        help="With --emit-config: skip tables below this row count (default 1)")
+    parser.add_argument("--out", help="Write the full schema JSON here")
+    args = parser.parse_args()
+
+    if args.drivers:
+        return list_drivers()
+
+    for required in ("host", "database", "user"):
+        if not getattr(args, required):
+            parser.error(f"--{required} is required (or use --drivers)")
+    password = args.password or os.getenv("MSSQL_PASSWORD") or getpass.getpass("Password: ")
+
+    print(f"Connecting to {args.host}:{args.port}/{args.database} as {args.user} via {args.library}...")
+    try:
+        conn = connect(args, password)
+    except Exception as e:  # noqa: BLE001
+        print(f"\nCONNECTION FAILED: {type(e).__name__}: {e}")
+        print("Check: host/port reachable, SQL Server authentication enabled (not Windows-only),")
+        print("       login exists and has db_datareader on the database, TCP/IP protocol enabled.")
+        return 1
+
+    try:
+        data = probe(conn, args)
+    finally:
+        conn.close()
+
+    print_summary(data)
+    if args.emit_config:
+        emit_config(data, args.min_rows)
+    if args.out:
+        Path(args.out).write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        print(f"\nFull schema written to {args.out} — send this back to ValueWorks.")
+    else:
+        print("\nTip: add --out schema.json to save the full dump.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
