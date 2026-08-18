@@ -72,6 +72,21 @@ matches `connection.driver` in `config.yaml`:
 Get-OdbcDriver | Where-Object Name -like "*SQL Server*" | Select-Object Name
 ```
 
+To verify the pyodbc path end to end, run the probe against the same database with both
+libraries and compare — `probe_mssql.py` connects through `common/mssql.py`, the exact
+code path a source uses, so agreement means the source will connect too:
+
+```powershell
+poetry run python tools\probe_mssql.py --library pymssql --host <server> `
+    --database <db> --user vw_readonly --out via-pymssql.json
+poetry run python tools\probe_mssql.py --library pyodbc  --host <server> `
+    --database <db> --user vw_readonly --driver "ODBC Driver 18 for SQL Server" `
+    --out via-pyodbc.json
+```
+
+If pyodbc fails while pymssql succeeds, the driver name or the `encrypt` /
+`trust_server_certificate` settings are wrong — not the network.
+
 ### 6. Configuration
 
 Copy `.env.example` to `.env` and fill in real secrets, then restrict who can read it —

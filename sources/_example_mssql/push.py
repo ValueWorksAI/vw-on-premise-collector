@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
+from common import mssql
 from common.config import ObjectSpec
 from common.source import Source
 
@@ -26,37 +27,7 @@ FETCH_BATCH_SIZE = 10_000
 
 class MSSQLSource(Source):
     def authenticate(self) -> None:
-        c = self.config.connection
-        library = c.get("library", "pymssql")
-        if library == "pymssql":
-            import pymssql  # deferred import: only needed when an MSSQL source is configured
-
-            self.placeholder = "%s"
-            self.conn = pymssql.connect(
-                server=c["host"],
-                port=int(c.get("port", 1433)),
-                database=c["database"],
-                user=c["username"],
-                password=c["password"],
-                login_timeout=int(c.get("login_timeout", 30)),
-            )
-        elif library == "pyodbc":
-            import pyodbc
-
-            self.placeholder = "?"
-            parts = [
-                f"DRIVER={{{c.get('driver', 'ODBC Driver 18 for SQL Server')}}}",
-                f"SERVER={c['host']},{c.get('port', 1433)}",
-                f"DATABASE={c['database']}",
-                f"UID={c['username']}",
-                f"PWD={c['password']}",
-                f"Encrypt={'yes' if c.get('encrypt', True) else 'no'}",
-            ]
-            if c.get("trust_server_certificate", False):
-                parts.append("TrustServerCertificate=yes")
-            self.conn = pyodbc.connect(";".join(parts), timeout=int(c.get("login_timeout", 30)))
-        else:
-            raise ValueError(f"Unknown connection.library {library!r} (use 'pymssql' or 'pyodbc')")
+        self.conn, self.placeholder = mssql.connect(self.config.connection)
 
     def build_filter(self, obj: ObjectSpec, partition: Any | None,
                      lower: str | None, upper: str | None) -> tuple[str, list[Any]]:

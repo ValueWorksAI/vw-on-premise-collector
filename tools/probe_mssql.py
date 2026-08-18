@@ -33,6 +33,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+from common import mssql  # noqa: E402
+
 # Types usable as `timestamp_field` (the collector filters with `col > ? AND col <= ?`).
 DELTA_TYPES = {"datetime", "datetime2", "smalldatetime", "datetimeoffset", "date"}
 # Changes on every row update but cannot be compared to a timestamp — needs custom code.
@@ -71,20 +73,14 @@ def list_drivers() -> int:
 
 
 def connect(args: argparse.Namespace, password: str):
-    """Same connection logic as sources/_example_mssql/push.py."""
-    if args.library == "pymssql":
-        import pymssql
-
-        return pymssql.connect(server=args.host, port=int(args.port), database=args.database,
-                               user=args.user, password=password, login_timeout=args.login_timeout)
-    import pyodbc
-
-    parts = [f"DRIVER={{{args.driver}}}", f"SERVER={args.host},{args.port}",
-             f"DATABASE={args.database}", f"UID={args.user}", f"PWD={password}",
-             "Encrypt=yes" if args.encrypt else "Encrypt=no"]
-    if args.trust_server_certificate:
-        parts.append("TrustServerCertificate=yes")
-    return pyodbc.connect(";".join(parts), timeout=args.login_timeout)
+    """Delegates to common.mssql so this probe tests the exact code path a source uses."""
+    return mssql.connect({
+        "library": args.library, "host": args.host, "port": args.port,
+        "database": args.database, "username": args.user, "password": password,
+        "driver": args.driver, "encrypt": args.encrypt,
+        "trust_server_certificate": args.trust_server_certificate,
+        "login_timeout": args.login_timeout,
+    })[0]
 
 
 def _rows(conn, sql: str, params: tuple = ()) -> list[tuple]:
