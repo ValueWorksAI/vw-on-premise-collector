@@ -100,20 +100,23 @@ can be done without us. Steps 1–6 above, then:
 poetry run python tools\check_azure.py --container warehouse --prefix raw/<name>
 poetry run python tools\probe_mssql.py --drivers
 poetry run python tools\probe_mssql.py --host <server> --database <db> `
-    --user vw_readonly --sample --out <name>-schema.json
+    --user vw_readonly --sample --source-name <name> `
+    --emit-config sources\<name>\config.yaml
 ```
+
+The third command prints a summary of the tables it can see and writes a complete
+`config.yaml` for them. No schema dump has to leave your network.
 
 Please send us back:
 
 1. The output of `check_azure.py` (it contains no credentials — the token signature is
    masked), so we can confirm the storage connection
 2. The output of `probe_mssql.py --drivers`
-3. The generated `<name>-schema.json`
+3. The printed table summary — object names, row counts and the detected delta column
 
-With those three we produce the configuration file that selects the tables to collect.
-**Until you have that file from us, the collector itself has nothing to run** — a run
-will exit with "No sources to run", which is expected at this stage. The scheduled task
-(step 8) is best created after the config file has arrived.
+That summary is enough for us to review the table selection with you. Once the config
+exists the collector has something to run, so the scheduled task (step 8) can be created
+straight away.
 
 If any step fails, the log output is more useful to us than a description — please paste
 it as text rather than a screenshot where possible.

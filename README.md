@@ -265,18 +265,29 @@ Then, on the machine, in this order:
 # 1. Is the SAS token right? (scope, permissions, expiry, List/Write/Read, real AzCopy upload)
 poetry run python tools/check_azure.py --container warehouse --prefix raw/<name>
 
-# 2. What does the source database look like? Writes a JSON dump to send back.
+# 2. What does the source database look like? Prints a summary and writes a
+#    complete, ready-to-use config.yaml.
 poetry run python tools/probe_mssql.py --host <server> --database <db> \
-    --user vw_readonly --sample --emit-config --out <name>-schema.json
+    --user vw_readonly --sample --source-name <name> \
+    --emit-config sources/<name>/config.yaml
 
 # 2b. If the product's database engine is unknown, this needs no connection at all:
 poetry run python tools/probe_mssql.py --drivers
 ```
 
 Run `check_azure.py` **first** — it surfaces proxy and TLS-interception problems, which are
-the most common cause of a failing install, before any database work. The schema dump from
-step 2 is enough to author `config.yaml` offline, so source selection does not need another
-session with the customer.
+the most common cause of a failing install, before any database work.
+
+Step 2 generates the source config on the spot, so nothing has to be sent back and forth to
+get a working collector. Only the printed summary — object names, row counts, delta
+candidates — is needed to review the table selection; add `--out schema.json` for the full
+column-level dump, but note that customers often treat a complete schema as confidential and
+it is not required (objects default to `SELECT *` when `extra.columns` is omitted).
+
+Generated configs start **every object on full refresh** (`timestamp_field: null`), with the
+detected delta candidate recorded in a comment. Enable delta per object later, with
+`--enable-delta` or by hand, once volumes justify it and the database clock domain has been
+checked — see [Delta refresh](#delta-refresh).
 
 ## Adding a new source
 

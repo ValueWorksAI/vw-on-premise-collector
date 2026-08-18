@@ -105,21 +105,24 @@ ohne uns erledigen. Zunächst die Schritte 1–6 oben, dann:
 poetry run python tools\check_azure.py --container warehouse --prefix raw/<name>
 poetry run python tools\probe_mssql.py --drivers
 poetry run python tools\probe_mssql.py --host <server> --database <db> `
-    --user vw_readonly --sample --out <name>-schema.json
+    --user vw_readonly --sample --source-name <name> `
+    --emit-config sources\<name>\config.yaml
 ```
+
+Der dritte Befehl zeigt eine Übersicht der sichtbaren Tabellen und schreibt daraus eine
+vollständige `config.yaml`. Es muss also kein Schema-Abzug Ihr Netz verlassen.
 
 Bitte senden Sie uns zurück:
 
 1. Die Ausgabe von `check_azure.py` (enthält keine Zugangsdaten — die Signatur des Tokens
    wird maskiert), damit wir die Storage-Verbindung bestätigen können
 2. Die Ausgabe von `probe_mssql.py --drivers`
-3. Die erzeugte Datei `<name>-schema.json`
+3. Die ausgegebene Tabellenübersicht — Objektnamen, Zeilenzahlen und die erkannte
+   Delta-Spalte
 
-Daraus erstellen wir die Konfigurationsdatei, die festlegt, welche Tabellen abgeholt
-werden. **Bis Sie diese Datei von uns erhalten haben, hat der Collector nichts
-abzuarbeiten** — ein Lauf endet dann mit „No sources to run". Das ist zu diesem Zeitpunkt
-korrekt und kein Fehler. Den geplanten Task (Schritt 8) legen Sie am besten erst an,
-nachdem die Konfigurationsdatei vorliegt.
+Damit können wir die Tabellenauswahl gemeinsam mit Ihnen prüfen. Sobald die Konfiguration
+vorliegt, hat der Collector etwas abzuarbeiten — der geplante Task (Schritt 8) kann dann
+direkt angelegt werden.
 
 Falls ein Schritt fehlschlägt, ist die Logausgabe für uns hilfreicher als eine
 Beschreibung — bitte möglichst als Text und nicht als Screenshot.
