@@ -91,6 +91,33 @@ Get-OdbcDriver | Select-Object Name, Platform
 A screenshot or the text output is enough. This lets us determine before the session
 whether we connect via SQL Server, via generic ODBC, or via a file export.
 
+## Setting it up without a joint session
+
+If you are working through this on your own, everything except the final collector run
+can be done without us. Steps 1–6 above, then:
+
+```powershell
+poetry run python tools\check_azure.py --container warehouse --prefix raw/<name>
+poetry run python tools\probe_mssql.py --drivers
+poetry run python tools\probe_mssql.py --host <server> --database <db> `
+    --user vw_readonly --sample --out <name>-schema.json
+```
+
+Please send us back:
+
+1. The output of `check_azure.py` (it contains no credentials — the token signature is
+   masked), so we can confirm the storage connection
+2. The output of `probe_mssql.py --drivers`
+3. The generated `<name>-schema.json`
+
+With those three we produce the configuration file that selects the tables to collect.
+**Until you have that file from us, the collector itself has nothing to run** — a run
+will exit with "No sources to run", which is expected at this stage. The scheduled task
+(step 8) is best created after the config file has arrived.
+
+If any step fails, the log output is more useful to us than a description — please paste
+it as text rather than a screenshot where possible.
+
 ## Agenda for the session (approx. 30–45 min)
 
 1. Connectivity test against Azure Storage (`tools/check_azure.py`) — first, because

@@ -117,6 +117,10 @@ poetry run python tools\probe_mssql.py --drivers
 poetry run python orchestrator.py --mode delta --sources <name>
 ```
 
+The third command only works once a source folder exists under `sources/`. On a fresh
+install there is none, and the orchestrator exits `2` with "No sources to run" — that is
+expected, not a failure. The first two commands are the ones that validate the install.
+
 ### 8. Scheduled task
 
 The GUI works, but three settings are easy to miss and each causes a task that silently
