@@ -21,15 +21,136 @@ Customer-specific source folders are never committed to this repo — only the f
 
 ## Setup — Windows
 
-1. Install Python 3.10–3.14.
-2. Install Poetry: `pip install poetry`
-3. Install AzCopy v10 — required for uploads.
-   - Download: <https://aka.ms/downloadazcopy-v10-windows>
-   - Extract `azcopy.exe` somewhere (default expected path: `C:\AzCopy\azcopy.exe`).
-   - Override with `AZCOPY_PATH` in `.env` if installed elsewhere.
-4. `cd C:\vw-on-prem-collector && poetry install`
-5. Copy `.env.example` to `.env` and fill in real secrets.
-6. Schedule `run.ps1` in Task Scheduler (daily).
+The collector runs as a daily scheduled task. Installation needs local admin rights;
+the task itself should run under a dedicated service account.
+
+### 1. Python 3.10–3.14
+
+Install from <https://www.python.org/downloads/> and tick **"Add python.exe to PATH"**.
+
+Do **not** use the Microsoft Store build. It installs into a per-user sandboxed
+`WindowsApps` path that a scheduled task running as a different account cannot execute,
+and it fails at run time rather than at install time — which makes it look like a
+collector bug weeks later.
+
+```powershell
+python --version
+```
+
+### 2. Poetry
+
+```powershell
+pip install poetry
+poetry --version
+```
+
+### 3. AzCopy v10
+
+Download <https://aka.ms/downloadazcopy-v10-windows>, extract the ZIP, and copy
+`azcopy.exe` to `C:\AzCopy\` (the default path the collector looks for; override with
+`AZCOPY_PATH` in `.env`).
+
+```powershell
+C:\AzCopy\azcopy.exe --version
+```
+
+### 4. The collector
+
+```powershell
+cd C:\vw-on-prem-collector
+poetry install                  # HTTP/API sources
+poetry install --with mssql     # additionally for SQL Server sources
+```
+
+### 5. MSSQL sources with `library: pyodbc` only
+
+Not needed for the default `library: pymssql`, whose wheel bundles FreeTDS. For pyodbc,
+install the Microsoft ODBC driver from <https://aka.ms/odbc18> and confirm the name
+matches `connection.driver` in `config.yaml`:
+
+```powershell
+Get-OdbcDriver | Where-Object Name -like "*SQL Server*" | Select-Object Name
+```
+
+### 6. Configuration
+
+Copy `.env.example` to `.env` and fill in real secrets, then restrict who can read it —
+it holds the SAS token and database passwords:
+
+```powershell
+Copy-Item .env.example .env
+icacls .env /inheritance:r /grant:r "Administrators:(R,W)" /grant:r "SYSTEM:(R)" `
+            /grant:r "DOMAIN\svc_vwcollector:(R)"
+```
+
+Behind an outbound proxy, add it to `.env` rather than to the machine environment:
+
+```text
+HTTPS_PROXY=http://proxy.internal:8080
+```
+
+`.env` is loaded into the process environment before anything runs, so this reaches both
+the REST calls and the AzCopy subprocess.
+
+### 7. Verify before scheduling
+
+Run these in order — each isolates one failure domain, so you never debug two at once:
+
+```powershell
+poetry run python tools\check_azure.py --container warehouse --prefix raw/<name>
+poetry run python tools\probe_mssql.py --drivers
+poetry run python orchestrator.py --mode delta --sources <name>
+```
+
+### 8. Scheduled task
+
+The GUI works, but three settings are easy to miss and each causes a task that silently
+never runs. This sets them correctly:
+
+```powershell
+$repo = "C:\vw-on-prem-collector"
+$action = New-ScheduledTaskAction -Execute "powershell.exe" `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File $repo\run.ps1 -Mode delta" `
+    -WorkingDirectory $repo
+$trigger = New-ScheduledTaskTrigger -Daily -At 5:00am
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+    -DontStopIfGoingOnBatteries -AllowStartIfOnBatteries `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 6)
+Register-ScheduledTask -TaskName "ValueWorks Collector" -Action $action -Trigger $trigger `
+    -Settings $settings -RunLevel Limited `
+    -User "DOMAIN\svc_vwcollector" -Password (Read-Host "Service account password")
+```
+
+The three that matter:
+
+- **`-User` / `-Password`** — equivalent to "Run whether user is logged on or not".
+  Without it the task only runs while that user is interactively logged in.
+- **`-StartWhenAvailable`** — runs a missed schedule after the machine comes back up.
+  Without it, a reboot at 05:00 silently skips that day entirely.
+- **`-ExecutionPolicy Bypass`** — `run.ps1` is otherwise blocked by the default policy.
+
+Then trigger it once manually and confirm it actually ran as the service account:
+
+```powershell
+Start-ScheduledTask -TaskName "ValueWorks Collector"
+Get-ScheduledTaskInfo -TaskName "ValueWorks Collector"   # LastTaskResult 0 = success
+```
+
+Also confirm the machine will be awake: a host that sleeps or hibernates overnight will
+not run the task at all.
+
+### Logs and exit codes
+
+Logs go to `C:\logs\vw-on-prem-collector` (override with `VW_LOG_DIR` in `.env`).
+Orchestrator exit codes: `0` all sources succeeded, `1` at least one source failed,
+`2` configuration problem (unknown source, or AzCopy not found).
+
+| Symptom | Cause |
+|---|---|
+| AzCopy fails with 403 | SAS expired, missing permission, or IP restriction — run `check_azure.py` |
+| AzCopy fails with a TLS/certificate error | Proxy doing SSL inspection — see step 6 |
+| Works interactively, `LastTaskResult` non-zero | Service account cannot reach Python (Store build) or `.env` (ACL) |
+| Every run reports full-refresh | SAS lacks Read+List, so META cannot be read back — see [Delta refresh](#delta-refresh) |
 
 ## Setup — Ubuntu / Linux
 
@@ -103,7 +224,7 @@ Customer-specific source folders are never committed to this repo — only the f
    sudo systemctl enable --now vw-collector.timer
    ```
 
-Logs go to `C:\logs\vw-on-prem-collector` on Windows and `<repo>/logs` on Linux (override with `VW_LOG_DIR` in `.env`).
+Logs go to `<repo>/logs` (override with `VW_LOG_DIR` in `.env`).
 
 ## Running
 
