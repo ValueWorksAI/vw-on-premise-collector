@@ -101,6 +101,9 @@ def inspect_token(sas: str) -> None:
                     print("  [WARN] expires within 30 days — renew before scheduling")
         except ValueError:
             print(f"  [WARN] could not parse expiry se={expiry_raw}")
+    elif q.get("si"):
+        print("  [INFO] no expiry in the token — it comes from the stored access policy; "
+              "confirm the date in the portal and diarise the renewal")
     if q.get("sip"):
         print(f"  [INFO] IP-restricted to {q['sip']} — must match this host's public egress IP")
 
