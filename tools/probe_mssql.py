@@ -28,6 +28,7 @@ import getpass
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -106,6 +107,30 @@ def rank_delta_candidates(columns: list[dict]) -> list[str]:
     return [c["name"] for c in sorted(usable, key=score)]
 
 
+def clock_domain(conn) -> dict:
+    """Compare the server clock with the collector host clock.
+
+    Delta refresh builds its window from the collector's local wall clock and compares
+    it against database-native timestamp values. If the two clocks sit in different
+    time zones, the window is offset and rows changed inside the offset are skipped
+    permanently, because the watermark still advances. So capture it at onboarding.
+    """
+    server_now, server_utc = _rows(conn, "SELECT SYSDATETIME(), GETUTCDATE()")[0]
+    local_now = datetime.now()
+    try:
+        tz = _rows(conn, "SELECT CURRENT_TIMEZONE_ID()")[0][0]  # SQL Server 2019+
+    except Exception:  # noqa: BLE001
+        tz = None
+    return {
+        "server_local": str(server_now),
+        "server_utc": str(server_utc),
+        "server_timezone": tz,
+        "collector_local": local_now.isoformat(),
+        "skew_seconds": round((local_now - server_now).total_seconds()),
+        "server_is_utc": abs((server_now - server_utc).total_seconds()) < 60,
+    }
+
+
 def probe(conn, args: argparse.Namespace) -> dict:
     server_info = _rows(conn, "SELECT @@VERSION, DB_NAME(), SUSER_NAME(), "
                               "CAST(SERVERPROPERTY('Collation') AS nvarchar(128))")[0]
@@ -114,6 +139,7 @@ def probe(conn, args: argparse.Namespace) -> dict:
         "database": server_info[1],
         "login": server_info[2],
         "collation": server_info[3],
+        "clock": clock_domain(conn),
         "objects": [],
     }
 
@@ -171,7 +197,22 @@ def print_summary(data: dict) -> None:
     tables = [o for o in objects if o["type"] == "TABLE"]
     print(f"\nServer:    {data['server_version']}")
     print(f"Database:  {data['database']}  (login: {data['login']})")
-    print(f"Visible:   {len(tables)} tables, {len(objects) - len(tables)} views\n")
+    print(f"Visible:   {len(tables)} tables, {len(objects) - len(tables)} views")
+
+    clock = data.get("clock") or {}
+    skew = clock.get("skew_seconds")
+    print(f"Clock:     server {clock.get('server_local')} "
+          f"(tz {clock.get('server_timezone') or 'unknown'}"
+          f"{', UTC' if clock.get('server_is_utc') else ''}), "
+          f"collector offset {skew:+}s" if skew is not None else "Clock:     unknown")
+    if skew is not None and abs(skew) > 60:
+        print(f"  [WARN] the collector host clock is {abs(skew)}s ({abs(skew) / 3600:.1f}h) "
+              f"{'ahead of' if skew > 0 else 'behind'} the database clock.")
+        print("         Delta refresh compares a window built from the collector's local")
+        print("         clock against database timestamps, so rows changed inside that")
+        print("         offset would be skipped permanently. Report this before the")
+        print("         source config is written.")
+    print()
 
     print(f"{'OBJECT':<50} {'ROWS':>12}  DELTA CANDIDATE")
     print("-" * 90)

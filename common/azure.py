@@ -36,7 +36,10 @@ def upload_file(local: Path, blob_url: str, sas: str) -> None:
     dest = _with_sas(blob_url, sas)
     log.info(f"AzCopy upload: {local.name} -> {blob_url}")
     result = subprocess.run(
-        [_azcopy(), "copy", str(local), dest, "--overwrite=true"],
+        # --from-to is explicit rather than inferred: AzCopy derives the destination
+        # type from the hostname, which fails for anything that is not
+        # *.blob.core.windows.net (Azure Stack, private endpoints, the local emulator).
+        [_azcopy(), "copy", str(local), dest, "--overwrite=true", "--from-to=LocalBlob"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
