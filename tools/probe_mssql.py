@@ -131,6 +131,45 @@ def clock_domain(conn) -> dict:
     }
 
 
+
+def view_sources(conn) -> tuple[dict, dict]:
+    """Return (definitions, dependencies) for every view.
+
+    Views are the customer's to change, so a pipeline built on them is fragile. To
+    rebuild their logic on our side we need the SQL text; to know what to collect we
+    need the base tables. sys.sql_expression_dependencies gives the latter reliably
+    even when the view renames every column, which defeats name-matching.
+
+    Both need VIEW DEFINITION permission — db_datareader alone is not enough, so this
+    can come back empty against a least-privilege login. That is reported, not fatal.
+    """
+    definitions: dict[str, str] = {}
+    dependencies: dict[str, list[str]] = {}
+    try:
+        for schema, name, sql in _rows(conn, """
+            SELECT OBJECT_SCHEMA_NAME(m.object_id), OBJECT_NAME(m.object_id), m.definition
+            FROM sys.sql_modules m JOIN sys.views v ON v.object_id = m.object_id
+        """):
+            if sql:
+                definitions[name] = sql if isinstance(sql, str) else sql.decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001
+        print(f"  [WARN] could not read view definitions: {type(e).__name__}: {e}")
+    try:
+        for name, ref_schema, ref_name in _rows(conn, """
+            SELECT OBJECT_NAME(d.referencing_id), d.referenced_schema_name, d.referenced_entity_name
+            FROM sys.sql_expression_dependencies d
+            JOIN sys.views v ON v.object_id = d.referencing_id
+        """):
+            if name and ref_name:
+                dependencies.setdefault(name, [])
+                ref = f"{ref_schema or 'dbo'}.{ref_name}"
+                if ref not in dependencies[name]:
+                    dependencies[name].append(ref)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [WARN] could not read view dependencies: {type(e).__name__}: {e}")
+    return definitions, dependencies
+
+
 def probe(conn, args: argparse.Namespace) -> dict:
     server_info = _rows(conn, "SELECT @@VERSION, DB_NAME(), SUSER_NAME(), "
                               "CAST(SERVERPROPERTY('Collation') AS nvarchar(128))")[0]
@@ -170,6 +209,12 @@ def probe(conn, args: argparse.Namespace) -> dict:
         if obj is not None:
             obj["columns"].append({"name": col, "data_type": dtype, "nullable": nullable == "YES",
                                    "max_length": maxlen, "position": pos})
+
+    definitions, dependencies = view_sources(conn)
+    for o in objects.values():
+        if o["type"] == "VIEW":
+            o["definition"] = definitions.get(o["name"])
+            o["depends_on"] = dependencies.get(o["name"], [])
 
     selected = [
         o for o in objects.values()
@@ -213,6 +258,20 @@ def print_summary(data: dict) -> None:
         print("         offset would be skipped permanently. Report this before the")
         print("         source config is written.")
     print()
+
+    views = [o for o in objects if o["type"] == "VIEW"]
+    if views:
+        with_def = sum(1 for v in views if v.get("definition"))
+        with_dep = sum(1 for v in views if v.get("depends_on"))
+        print(f"Views:     {len(views)} — {with_def} with SQL text, {with_dep} with base-table info")
+        if not with_def and not with_dep:
+            print("  [WARN] no view internals readable. To collect base tables instead of views,")
+            print("         the login needs: GRANT VIEW DEFINITION ON SCHEMA::dbo TO <login>;")
+        else:
+            for v in sorted(views, key=lambda x: -len(x.get("depends_on") or []))[:10]:
+                dep = ", ".join(v.get("depends_on") or []) or "(none reported)"
+                print(f"    {v['name']:<40}-> {dep[:90]}")
+        print()
 
     print(f"{'OBJECT':<50} {'ROWS':>12}  DELTA CANDIDATE")
     print("-" * 90)
