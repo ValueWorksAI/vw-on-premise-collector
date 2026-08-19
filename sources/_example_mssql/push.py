@@ -41,6 +41,12 @@ class MSSQLSource(Source):
         if partition is not None and self.config.partition_field:
             clauses.append(f"[{self.config.partition_field}] = {ph}")
             params.append(partition)
+        # Static per-object predicate from config, e.g. a history cutoff
+        # ("[budat] >= '2024-01-01'"). Authored by us, not user input, so it is
+        # inlined as-is — never build it from anything a caller supplies.
+        static = obj.extra.get("where")
+        if static:
+            clauses.append(f"({static})")
         return " AND ".join(clauses), params
 
     def fetch(self, obj: ObjectSpec, partition: Any | None,

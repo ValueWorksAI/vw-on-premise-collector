@@ -41,3 +41,8 @@ objects:
         - Id
         - ModifiedAt
         - Amount
+      # Optional static predicate, ANDed into every query for this object.
+      # Useful as a history cutoff on tables that are too large to copy in full:
+      #   where: "[budat] >= '2024-01-01'"
+      # For a child table with no date of its own, filter via its parent:
+      #   where: "id IN (SELECT id FROM dbo.[Entry$Entry] WHERE budat >= '2024-01-01')"
