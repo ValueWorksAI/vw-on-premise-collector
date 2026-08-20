@@ -16,6 +16,7 @@ Azure, clean up local files.
 """
 from __future__ import annotations
 
+import json
 import logging
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -90,20 +91,32 @@ class Source(ABC):
         log.info(f"[{self.config.name}] wiping META dirs in {out_dir}")
         parquet.wipe_meta_dirs(out_dir)
 
+        results: list[dict[str, Any]] = []
         log.info(f"[{self.config.name}] authenticating")
-        self.authenticate()
+        try:
+            self.authenticate()
+        except Exception as e:  # noqa: BLE001
+            # Still publish a report: "could not connect" is exactly what we want to
+            # see in the lake without having to ask for the log file.
+            log.exception(f"[{self.config.name}] authentication FAILED: {e}")
+            results = [{"object": o.name, "status": "failed", "records": 0,
+                        "error": f"{type(e).__name__}: {e}"} for o in self.config.objects]
+            self._publish_run_report(results)
+            return 1
 
         # One bad object must not discard the whole run: without this a failure on the
         # last of N objects means nothing at all is uploaded, including the N-1 that
         # succeeded.
-        failed: list[tuple[str, str]] = []
         for i, obj in enumerate(self.config.objects, start=1):
             log.info(f"[{self.config.name}] object {i}/{len(self.config.objects)}: {obj.name}")
             try:
-                self._run_object(obj)
+                total, refresh_type = self._run_object(obj)
+                results.append({"object": obj.name, "status": "ok", "records": total,
+                                "refresh_type": refresh_type})
             except Exception as e:  # noqa: BLE001
                 log.exception(f"[{obj.name}] FAILED, continuing with the next object: {e}")
-                failed.append((obj.name, f"{type(e).__name__}: {e}"))
+                results.append({"object": obj.name, "status": "failed", "records": 0,
+                                "error": f"{type(e).__name__}: {e}"})
                 parquet.discard_parts(out_dir, obj.name)
 
         log.info(f"[{self.config.name}] uploading to Azure")
@@ -112,17 +125,52 @@ class Source(ABC):
         log.info(f"[{self.config.name}] local cleanup")
         parquet.cleanup_run(out_dir, [o.name for o in self.config.objects])
 
-        ok = len(self.config.objects) - len(failed)
+        failed = [r for r in results if r["status"] == "failed"]
+        self._publish_run_report(results)
+
+        ok = len(results) - len(failed)
         if failed:
-            log.error(f"[{self.config.name}] {ok}/{len(self.config.objects)} objects "
-                      f"collected; {len(failed)} failed:")
-            for name, err in failed:
-                log.error(f"    {name}: {err}")
+            log.error(f"[{self.config.name}] {ok}/{len(results)} objects collected; "
+                      f"{len(failed)} failed:")
+            for r in failed:
+                log.error(f"    {r['object']}: {r['error']}")
             return 1
-        log.info(f"[{self.config.name}] done, {ok} object(s)")
+        log.info(f"[{self.config.name}] done, {ok} object(s), "
+                 f"{sum(r['records'] for r in results):,} records")
         return 0
 
-    def _run_object(self, obj: ObjectSpec) -> None:
+    def _publish_run_report(self, results: list[dict[str, Any]]) -> None:
+        """Write a run summary and upload it to <prefix>/_runs/.
+
+        Lets us see from storage alone which objects landed and why the others did
+        not, instead of asking the customer's admin for the log file. Contains object
+        names, counts and error messages only — never connection details.
+        """
+        failed = [r for r in results if r["status"] == "failed"]
+        report = {
+            "source": self.config.name,
+            "mode": self.mode,
+            "collection_run": self.collection_start,
+            "objects_total": len(results),
+            "objects_ok": len(results) - len(failed),
+            "objects_failed": len(failed),
+            "records_total": sum(r.get("records", 0) for r in results),
+            "results": results,
+        }
+        ts = parquet.sanitize_timestamp(self.collection_start)
+        fp = self.config.output_dir / f"_run_{ts}.json"
+        try:
+            fp.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            azure.upload_file(fp, f"{self.config.azure.base_url}/_runs/_{ts}.json",
+                              self.config.azure.sas_token)
+            log.info(f"[{self.config.name}] run report -> _runs/_{ts}.json")
+        except Exception as e:  # noqa: BLE001
+            # Never let reporting failures mask the actual run outcome.
+            log.error(f"[{self.config.name}] could not publish run report: {e}")
+        finally:
+            fp.unlink(missing_ok=True)
+
+    def _run_object(self, obj: ObjectSpec) -> tuple[int, str]:
         lower, upper, refresh_type, is_delta = self.resolve_delta_bound(obj)
         log.info(f"[{obj.name}] mode={refresh_type} lower={lower} upper={upper}")
 
@@ -169,6 +217,7 @@ class Source(ABC):
             is_delta=is_delta, refresh_type=refresh_type,
             lower_bound=lower, upper_bound=upper, total_records=total,
         )
+        return total, refresh_type
 
     def _upload_all(self) -> None:
         out_dir = self.config.output_dir
