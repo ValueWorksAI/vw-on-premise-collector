@@ -29,6 +29,26 @@ def parts_dir(output_dir: Path, object_name: str) -> Path:
     return output_dir / f"_parts_{object_name}"
 
 
+def _timestamps_to_us(table: pa.Table) -> pa.Table:
+    """Normalise every timestamp column to microseconds.
+
+    pandas types a batch of in-range datetimes as datetime64[ns] but keeps a batch
+    containing an out-of-range one as object, which pyarrow reads as timestamp[us].
+    Unifying those two picks ns, and casting the us values into it overflows — abas
+    uses sentinel dates such as 9999-12-31, while ns stops at 2262. us reaches roughly
+    +/-290,000 years, and ns -> us is always safe, so standardise on us up front and
+    the batches can never disagree.
+    """
+    fields, changed = [], False
+    for f in table.schema:
+        if pa.types.is_timestamp(f.type) and f.type.unit != "us":
+            fields.append(f.with_type(pa.timestamp("us", tz=f.type.tz)))
+            changed = True
+        else:
+            fields.append(f)
+    return table.cast(pa.schema(fields)) if changed else table
+
+
 def write_part(records: list[dict], output_dir: Path, object_name: str,
                partition: Any | None, index: int) -> Path | None:
     """Write one batch of records. Returns the path, or None if there was nothing."""
@@ -38,7 +58,8 @@ def write_part(records: list[dict], output_dir: Path, object_name: str,
     d.mkdir(parents=True, exist_ok=True)
     tag = "all" if partition is None else str(partition)
     fp = d / f"p{tag}_{index:05d}.parquet"
-    pd.DataFrame(records).to_parquet(fp, index=False, engine="pyarrow")
+    table = _timestamps_to_us(pa.Table.from_pandas(pd.DataFrame(records), preserve_index=False))
+    pq.write_table(table, fp)
     return fp
 
 
@@ -55,7 +76,15 @@ def _align(table: pa.Table, schema: pa.Schema) -> pa.Table:
     for field in schema:
         if field.name in table.schema.names:
             col = table.column(field.name)
-            arrays.append(col if col.type.equals(field.type) else col.cast(field.type))
+            if col.type.equals(field.type):
+                arrays.append(col)
+            else:
+                try:
+                    arrays.append(col.cast(field.type))
+                except Exception as e:  # noqa: BLE001
+                    raise ValueError(
+                        f"column {field.name!r}: cannot reconcile {col.type} across "
+                        f"batches with unified type {field.type} ({e})") from e
         else:
             arrays.append(pa.nulls(table.num_rows, field.type))
     return pa.Table.from_arrays(arrays, schema=schema)
