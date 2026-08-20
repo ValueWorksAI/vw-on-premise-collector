@@ -45,6 +45,10 @@ class SourceConfig:
     objects: list[ObjectSpec]
     connection: dict[str, Any]  # free-form, source-specific
     max_workers: int = 5
+    # Records buffered before a batch is flushed to disk. Peak memory is roughly
+    # batch_size x column count, so this is the knob that decides whether a wide
+    # object fits in RAM at all.
+    batch_size: int = 100_000
 
     @classmethod
     def load(cls, config_path: Path) -> "SourceConfig":
@@ -62,4 +66,5 @@ class SourceConfig:
             objects=objects,
             connection=raw.get("connection", {}) or {},
             max_workers=int(raw.get("max_workers", 5)),
+            batch_size=int(raw.get("batch_size", 100_000)),
         )

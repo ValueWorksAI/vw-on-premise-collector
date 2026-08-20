@@ -24,3 +24,4 @@ sources/*/
 !sources/_example/
 !sources/_example_mssql/
 !sources/.gitkeep
+.DS_Store

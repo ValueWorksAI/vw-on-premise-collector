@@ -84,7 +84,7 @@ class Source(ABC):
 
     # ----- run loop -----
     def run(self) -> int:
-        """Returns process exit code. 0 on success."""
+        """Returns process exit code. 0 on success, 1 if any object failed."""
         out_dir = self.config.output_dir
         out_dir.mkdir(parents=True, exist_ok=True)
         log.info(f"[{self.config.name}] wiping META dirs in {out_dir}")
@@ -93,60 +93,79 @@ class Source(ABC):
         log.info(f"[{self.config.name}] authenticating")
         self.authenticate()
 
-        for obj in self.config.objects:
-            self._run_object(obj)
+        # One bad object must not discard the whole run: without this a failure on the
+        # last of N objects means nothing at all is uploaded, including the N-1 that
+        # succeeded.
+        failed: list[tuple[str, str]] = []
+        for i, obj in enumerate(self.config.objects, start=1):
+            log.info(f"[{self.config.name}] object {i}/{len(self.config.objects)}: {obj.name}")
+            try:
+                self._run_object(obj)
+            except Exception as e:  # noqa: BLE001
+                log.exception(f"[{obj.name}] FAILED, continuing with the next object: {e}")
+                failed.append((obj.name, f"{type(e).__name__}: {e}"))
+                parquet.discard_parts(out_dir, obj.name)
 
         log.info(f"[{self.config.name}] uploading to Azure")
         self._upload_all()
 
         log.info(f"[{self.config.name}] local cleanup")
         parquet.cleanup_run(out_dir, [o.name for o in self.config.objects])
-        log.info(f"[{self.config.name}] done")
+
+        ok = len(self.config.objects) - len(failed)
+        if failed:
+            log.error(f"[{self.config.name}] {ok}/{len(self.config.objects)} objects "
+                      f"collected; {len(failed)} failed:")
+            for name, err in failed:
+                log.error(f"    {name}: {err}")
+            return 1
+        log.info(f"[{self.config.name}] done, {ok} object(s)")
         return 0
 
     def _run_object(self, obj: ObjectSpec) -> None:
         lower, upper, refresh_type, is_delta = self.resolve_delta_bound(obj)
         log.info(f"[{obj.name}] mode={refresh_type} lower={lower} upper={upper}")
 
+        out_dir = self.config.output_dir
+        parquet.discard_parts(out_dir, obj.name)   # any leftovers from an earlier run
         partitions = self.list_partitions(obj)
+        batch_size = self.config.batch_size
 
         def _do_partition(p: Any | None) -> int:
+            """Fetch one partition, flushing to disk every batch_size records."""
             f = self.build_filter(obj, p, lower, upper)
-            records = []
+            buf: list[dict] = []
+            written = index = 0
             for r in self.fetch(obj, p, f):
-                records.append(self.transform_record(obj, r))
-            parquet.write_shard(records, self.config.output_dir, obj.name, p, self.collection_start)
-            return len(records)
+                buf.append(self.transform_record(obj, r))
+                if len(buf) >= batch_size:
+                    parquet.write_part(buf, out_dir, obj.name, p, index)
+                    written += len(buf)
+                    index += 1
+                    buf.clear()
+                    log.info(f"[{obj.name}] partition={p} {written:,} records so far")
+            if buf:
+                parquet.write_part(buf, out_dir, obj.name, p, index)
+                written += len(buf)
+            return written
 
         if len(partitions) > 1:
             with ThreadPoolExecutor(max_workers=self.config.max_workers) as ex:
                 futures = {ex.submit(_do_partition, p): p for p in partitions}
                 for fut in as_completed(futures):
                     p = futures[fut]
-                    try:
-                        n = fut.result()
-                        log.info(f"[{obj.name}] partition={p} records={n}")
-                    except Exception as e:  # noqa: BLE001
-                        log.error(f"[{obj.name}] partition={p} failed: {e}")
-                        raise
+                    n = fut.result()   # a partition failure fails the object
+                    log.info(f"[{obj.name}] partition={p} records={n}")
         else:
             n = _do_partition(partitions[0])
             log.info(f"[{obj.name}] records={n}")
 
-        # Merge (if partitioned) or move single shard up
-        if len(partitions) > 1 or partitions[0] is not None:
-            _merged, total = parquet.merge_shards(self.config.output_dir, obj.name, self.collection_start)
-        else:
-            # Single, unpartitioned: the shard already lives at output_dir/obj.name
-            merged_dir = self.config.output_dir / obj.name
-            pqs = list(merged_dir.glob(f"_{parquet.sanitize_timestamp(self.collection_start)}.parquet"))
-            total = 0
-            if pqs:
-                import pandas as pd
-                total = len(pd.read_parquet(pqs[0]))
+        # Row count comes from the combine, so nothing is read back to count it.
+        _fp, total = parquet.combine_parts(out_dir, obj.name, self.collection_start)
+        parquet.discard_parts(out_dir, obj.name)
 
         parquet.write_meta(
-            self.config.output_dir, obj.name, self.collection_start,
+            out_dir, obj.name, self.collection_start,
             is_delta=is_delta, refresh_type=refresh_type,
             lower_bound=lower, upper_bound=upper, total_records=total,
         )

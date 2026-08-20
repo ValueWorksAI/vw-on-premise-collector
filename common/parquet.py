@@ -1,4 +1,9 @@
-"""Parquet sharding, merging, META file writing, and local cleanup."""
+"""Parquet batch writing, streaming combine, META file writing, and local cleanup.
+
+Objects are written in batches and combined by streaming row groups, so peak memory
+is bounded by the batch size rather than by the size of the object. Holding a whole
+object in memory is what made the widest tables impossible to collect.
+"""
 from __future__ import annotations
 
 import json
@@ -8,6 +13,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 log = logging.getLogger(__name__)
 
@@ -17,43 +24,75 @@ def sanitize_timestamp(iso: str) -> str:
     return iso.replace(":", "+").split(".")[0]
 
 
-def write_shard(records: list[dict], output_dir: Path, object_name: str, partition: Any | None,
-                timestamp: str) -> Path | None:
-    """Write a per-partition shard parquet. Returns path or None if no records."""
+def parts_dir(output_dir: Path, object_name: str) -> Path:
+    """Scratch directory holding one run's batch files for an object."""
+    return output_dir / f"_parts_{object_name}"
+
+
+def write_part(records: list[dict], output_dir: Path, object_name: str,
+               partition: Any | None, index: int) -> Path | None:
+    """Write one batch of records. Returns the path, or None if there was nothing."""
     if not records:
         return None
-    folder_name = f"{object_name}_Partition{partition}" if partition is not None else object_name
-    out = output_dir / folder_name
-    out.mkdir(parents=True, exist_ok=True)
-    fp = out / f"_{sanitize_timestamp(timestamp)}.parquet"
+    d = parts_dir(output_dir, object_name)
+    d.mkdir(parents=True, exist_ok=True)
+    tag = "all" if partition is None else str(partition)
+    fp = d / f"p{tag}_{index:05d}.parquet"
     pd.DataFrame(records).to_parquet(fp, index=False, engine="pyarrow")
-    log.info(f"  Wrote {len(records):,} records -> {fp}")
     return fp
 
 
-def merge_shards(output_dir: Path, object_name: str, timestamp: str) -> tuple[Path | None, int]:
-    """Merge all `{object_name}_Partition*` shards from this run into one parquet.
+def _align(table: pa.Table, schema: pa.Schema) -> pa.Table:
+    """Reshape a batch to the unified schema, filling absent columns with nulls.
 
-    Returns (merged_path, total_records). (None, 0) if nothing to merge.
+    Batches are typed independently, so a column that is all-NULL in one batch and a
+    string in the next arrives with a different type. Without this the combine fails
+    partway through, after the source has already been read.
     """
-    ts = sanitize_timestamp(timestamp)
-    shard_dirs = list(output_dir.glob(f"{object_name}_Partition*"))
-    dfs: list[pd.DataFrame] = []
-    for d in shard_dirs:
-        for pq in d.glob(f"_{ts}.parquet"):
-            try:
-                dfs.append(pd.read_parquet(pq))
-            except Exception as e:  # noqa: BLE001
-                log.error(f"Failed to read {pq}: {e}")
-    if not dfs:
+    if table.schema.equals(schema):
+        return table
+    arrays = []
+    for field in schema:
+        if field.name in table.schema.names:
+            col = table.column(field.name)
+            arrays.append(col if col.type.equals(field.type) else col.cast(field.type))
+        else:
+            arrays.append(pa.nulls(table.num_rows, field.type))
+    return pa.Table.from_arrays(arrays, schema=schema)
+
+
+def combine_parts(output_dir: Path, object_name: str, timestamp: str) -> tuple[Path | None, int]:
+    """Stream every batch of this object into one parquet. Returns (path, row count).
+
+    Row groups are copied one at a time, so memory stays at one row group rather than
+    one object — unlike a pandas concat, which needs the whole thing twice over.
+    """
+    parts = sorted(parts_dir(output_dir, object_name).glob("*.parquet"))
+    if not parts:
         return None, 0
-    merged = pd.concat(dfs, ignore_index=True)
-    merged_dir = output_dir / object_name
-    merged_dir.mkdir(parents=True, exist_ok=True)
-    fp = merged_dir / f"_{ts}.parquet"
-    merged.to_parquet(fp, index=False, engine="pyarrow")
-    log.info(f"  Merged {len(dfs)} shards, {len(merged):,} records -> {fp}")
-    return fp, len(merged)
+    schema = pa.unify_schemas([pq.ParquetFile(p).schema_arrow for p in parts],
+                              promote_options="permissive")
+    out = output_dir / object_name
+    out.mkdir(parents=True, exist_ok=True)
+    fp = out / f"_{sanitize_timestamp(timestamp)}.parquet"
+    total = 0
+    writer = pq.ParquetWriter(fp, schema)
+    try:
+        for part in parts:
+            pf = pq.ParquetFile(part)
+            for i in range(pf.num_row_groups):
+                table = _align(pf.read_row_group(i), schema)
+                writer.write_table(table)
+                total += table.num_rows
+    finally:
+        writer.close()
+    log.info(f"  Combined {len(parts)} batch file(s), {total:,} records -> {fp}")
+    return fp, total
+
+
+def discard_parts(output_dir: Path, object_name: str) -> None:
+    """Drop an object's batch files (after combining, or after a failure)."""
+    shutil.rmtree(parts_dir(output_dir, object_name), ignore_errors=True)
 
 
 def write_meta(output_dir: Path, object_name: str, timestamp: str, *,
@@ -78,7 +117,7 @@ def write_meta(output_dir: Path, object_name: str, timestamp: str, *,
 
 
 def cleanup_run(output_dir: Path, object_names: Iterable[str]) -> None:
-    """Keep only latest parquet per object dir; delete all `_Partition*` shard dirs."""
+    """Keep only the latest parquet per object dir; delete all batch directories."""
     for obj in object_names:
         obj_dir = output_dir / obj
         if obj_dir.exists():
@@ -86,10 +125,10 @@ def cleanup_run(output_dir: Path, object_names: Iterable[str]) -> None:
             for old in pqs[1:]:
                 log.info(f"  Removed old parquet: {old.name}")
                 old.unlink(missing_ok=True)
-    for shard_dir in output_dir.glob("*_Partition*"):
-        if shard_dir.is_dir():
-            log.info(f"  Removed shard dir: {shard_dir.name}")
-            shutil.rmtree(shard_dir, ignore_errors=True)
+    for d in list(output_dir.glob("_parts_*")) + list(output_dir.glob("*_Partition*")):
+        if d.is_dir():
+            log.info(f"  Removed batch dir: {d.name}")
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def wipe_meta_dirs(output_dir: Path) -> None:
