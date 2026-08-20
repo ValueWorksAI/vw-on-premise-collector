@@ -12,7 +12,6 @@ import shutil
 from pathlib import Path
 from typing import Any, Iterable
 
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -58,7 +57,12 @@ def write_part(records: list[dict], output_dir: Path, object_name: str,
     d.mkdir(parents=True, exist_ok=True)
     tag = "all" if partition is None else str(partition)
     fp = d / f"p{tag}_{index:05d}.parquet"
-    table = _timestamps_to_us(pa.Table.from_pandas(pd.DataFrame(records), preserve_index=False))
+    # Built straight from the dicts rather than via pandas. A pandas DataFrame
+    # coerces an integer column containing NULLs to float64, which silently rounds
+    # values above 2**53 — abas keys such as 100100000000002903 became
+    # ...2896 — and then made batches disagree between int64 and double, whose cast
+    # fails outright. from_pylist keeps int64 with nulls, and is one copy cheaper.
+    table = _timestamps_to_us(pa.Table.from_pylist(records))
     pq.write_table(table, fp)
     return fp
 
