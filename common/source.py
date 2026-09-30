@@ -11,8 +11,8 @@ Optional overrides:
   - resolve_delta_bound(self, obj, mode) -> tuple[lower, upper, refresh_type, is_delta]
 
 The base class owns the run loop: per object, resolve delta bound, fetch each
-partition, write per-partition parquet shards, merge, write META, upload to
-Azure, clean up local files.
+partition in batches, combine, write META, upload to Azure, then drop the local
+parquet again before starting the next object.
 """
 from __future__ import annotations
 
@@ -101,6 +101,11 @@ class Source(ABC):
             log.exception(f"[{self.config.name}] authentication FAILED: {e}")
             results = [{"object": o.name, "status": "failed", "records": 0,
                         "error": f"{type(e).__name__}: {e}"} for o in self.config.objects]
+            # Still sweep. Nothing was collected, but an earlier run may have died
+            # before its own sweep, and a source that is down for days would otherwise
+            # leave those files sitting on the disk for exactly as long.
+            parquet.cleanup_run(out_dir, [o.name for o in self.config.objects],
+                                keep_latest=self.config.keep_local_copy)
             self._publish_run_report(results)
             return 1
 
@@ -118,12 +123,14 @@ class Source(ABC):
                 results.append({"object": obj.name, "status": "failed", "records": 0,
                                 "error": f"{type(e).__name__}: {e}"})
                 parquet.discard_parts(out_dir, obj.name)
+                # Not gated on keep_local_copy: a failed object's parquet is truncated
+                # or unusable and was never uploaded, so keeping it would leave the
+                # newest file on disk misrepresenting the last successful push.
+                parquet.discard_output(out_dir, obj.name, self.collection_start, "failed")
 
-        log.info(f"[{self.config.name}] uploading to Azure")
-        self._upload_all()
-
-        log.info(f"[{self.config.name}] local cleanup")
-        parquet.cleanup_run(out_dir, [o.name for o in self.config.objects])
+        log.info(f"[{self.config.name}] sweeping local leftovers")
+        parquet.cleanup_run(out_dir, [o.name for o in self.config.objects],
+                            keep_latest=self.config.keep_local_copy)
 
         failed = [r for r in results if r["status"] == "failed"]
         self._publish_run_report(results)
@@ -217,34 +224,43 @@ class Source(ABC):
             is_delta=is_delta, refresh_type=refresh_type,
             lower_bound=lower, upper_bound=upper, total_records=total,
         )
+
+        # Upload and reclaim here rather than after the whole object loop. Deferring
+        # both meant every object's parquet was still on disk when the last one was
+        # written, so a run peaked at the previous run's copy plus this one's — two
+        # full datasets — which is what ran the collector's disk out. Peak is now one
+        # object. An upload failure raises, so the object is marked failed and its
+        # file is left for the end-of-run sweep.
+        self._upload_object(obj)
+        if not self.config.keep_local_copy:
+            parquet.discard_output(out_dir, obj.name, self.collection_start, "uploaded")
         return total, refresh_type
 
-    def _upload_all(self) -> None:
-        out_dir = self.config.output_dir
+    def _upload_object(self, obj: ObjectSpec) -> None:
+        """Push one object's parquet, then its META.
+
+        Order matters: META carries the delta watermark, so dying between the two
+        makes the next run re-collect the window rather than skip rows whose parquet
+        never landed.
+        """
         target = self.config.azure
         ts = parquet.sanitize_timestamp(self.collection_start)
-        for obj in self.config.objects:
-            obj_dir = out_dir / obj.name
-            if not obj_dir.exists():
-                continue
-            meta_fp = obj_dir / "META" / f"_{ts}.json"
-            if not meta_fp.exists():
-                log.warning(f"[{obj.name}] no META for this run, skipping upload")
-                continue
-            parquet_fp = obj_dir / f"_{ts}.parquet"
-            if parquet_fp.exists():
-                azure.upload_file(
-                    parquet_fp,
-                    f"{target.base_url}/{obj.name}/{parquet_fp.name}",
-                    target.sas_token,
-                )
-            else:
-                log.info(f"[{obj.name}] no new data, parquet skipped")
+        obj_dir = self.config.output_dir / obj.name
+        parquet_fp = obj_dir / f"_{ts}.parquet"
+        meta_fp = obj_dir / "META" / f"_{ts}.json"
+        if parquet_fp.exists():
             azure.upload_file(
-                meta_fp,
-                f"{target.base_url}/{obj.name}/META/{meta_fp.name}",
+                parquet_fp,
+                f"{target.base_url}/{obj.name}/{parquet_fp.name}",
                 target.sas_token,
             )
+        else:
+            log.info(f"[{obj.name}] no new data, parquet skipped")
+        azure.upload_file(
+            meta_fp,
+            f"{target.base_url}/{obj.name}/META/{meta_fp.name}",
+            target.sas_token,
+        )
 
 
 def load_source(source_dir: Path, mode: str) -> Source:

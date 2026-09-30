@@ -49,6 +49,12 @@ class SourceConfig:
     # batch_size x column count, so this is the knob that decides whether a wide
     # object fits in RAM at all.
     batch_size: int = 100_000
+    # Keep an object's parquet on the local disk after it has been uploaded.
+    # Off by default: nothing in the run path ever reads it back — the delta
+    # watermark comes from the META blob in Azure, and wipe_meta_dirs clears the
+    # local META before a run starts — so it is a second full copy of the dataset
+    # earning nothing. Turn it on only to inspect output on the machine itself.
+    keep_local_copy: bool = False
 
     @classmethod
     def load(cls, config_path: Path) -> "SourceConfig":
@@ -67,4 +73,5 @@ class SourceConfig:
             connection=raw.get("connection", {}) or {},
             max_workers=int(raw.get("max_workers", 5)),
             batch_size=int(raw.get("batch_size", 100_000)),
+            keep_local_copy=bool(raw.get("keep_local_copy", False)),
         )

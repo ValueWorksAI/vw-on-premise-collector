@@ -41,6 +41,25 @@ def discover_sources() -> list[Path]:
     return out
 
 
+def shared_output_dirs(sources: list[Path]) -> list[tuple[str, list[str]]]:
+    """Find selected sources that write to the same output_dir.
+
+    Two sources sharing one directory cannot run concurrently: they collide on the
+    `_parts_<object>` scratch dirs, and each one's end-of-run sweep deletes files the
+    other has not uploaded yet. Sequentially they are fine — nothing interleaves.
+    """
+    from common.config import SourceConfig
+
+    by_dir: dict[str, list[str]] = {}
+    for s in sources:
+        try:
+            cfg = SourceConfig.load(s / "config.yaml")
+        except Exception:  # noqa: BLE001
+            continue  # a config that cannot load fails in its own subprocess, as before
+        by_dir.setdefault(str(cfg.output_dir).rstrip("/\\").lower(), []).append(s.name)
+    return [(d, names) for d, names in sorted(by_dir.items()) if len(names) > 1]
+
+
 def run_one_subprocess(source_name: str, mode: str) -> int:
     log = logging.getLogger("orchestrator")
     log.info(f"[{source_name}] launching subprocess (mode={mode})")
@@ -108,6 +127,16 @@ def main() -> int:
     if not sources:
         log.error("No sources to run")
         return 2
+
+    if args.parallel and len(sources) > 1:
+        clashes = shared_output_dirs(sources)
+        if clashes:
+            log.error("Refusing to run in parallel: these sources share an output_dir "
+                      "and would delete each other's in-flight files:")
+            for d, names in clashes:
+                log.error(f"    {d} <- {', '.join(names)}")
+            log.error("Give each source its own output_dir, or drop --parallel.")
+            return 2
 
     log.info(f"Running {len(sources)} source(s): {[s.name for s in sources]} (parallel={args.parallel})")
 

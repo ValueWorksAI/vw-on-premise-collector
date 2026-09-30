@@ -5,6 +5,11 @@ name: example-mssql
 output_dir: /var/opt/vw-on-prem-collector/output   # Windows: C:\output\example-mssql
 max_workers: 1
 
+# Delete each object's parquet from output_dir as soon as it lands in Azure (default).
+# Set true to keep the newest one per object for inspection on the machine itself;
+# that costs a full second copy of the dataset on disk and nothing reads it back.
+keep_local_copy: false
+
 azure:
   storage_url: ${env:AZURE_STORAGE_URL}
   sas_token:   ${env:AZURE_STORAGE_SAS_TOKEN}

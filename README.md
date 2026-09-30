@@ -302,3 +302,13 @@ The orchestrator auto-discovers any folder under `sources/` containing both `con
 ## Delta refresh
 
 Objects with a `timestamp_field` run incrementally: each run reads its own latest META file from Azure and only fetches rows changed since the previous upper bound. Objects without a `timestamp_field` full-refresh every run. Because META files are read back from Azure, the SAS token needs **Read + List** in addition to **Create + Write** (container-scoped; no Delete required).
+
+## Local disk usage
+
+Each object's parquet is uploaded and then deleted as soon as it lands, so peak local disk is **one object**, not one dataset. Size the machine for the largest single object plus headroom, not for the total volume.
+
+Set `keep_local_copy: true` in a source's `config.yaml` to keep the newest parquet per object instead. Nothing in the run path reads it back — the delta watermark comes from the META blob in Azure, and local META is wiped at the start of every run — so it is purely for inspecting output on the machine. It costs a second full copy of the dataset: the kept copy from the previous run coexists with the one being written, so peak becomes **2x the dataset**. Leave it off on anything volume-constrained.
+
+The `_parts_*` scratch directories are removed per object after the combine, and an end-of-run sweep clears anything an upload failure or a crashed run left behind.
+
+Each source needs its **own** `output_dir`. Two sources sharing one directory collide on the `_parts_<object>` scratch dirs and on each other's sweep, so `--parallel` refuses to start when it detects it (exit `2`). Sequential runs are unaffected — nothing interleaves.

@@ -149,14 +149,43 @@ def write_meta(output_dir: Path, object_name: str, timestamp: str, *,
     return fp
 
 
-def cleanup_run(output_dir: Path, object_names: Iterable[str]) -> None:
-    """Keep only the latest parquet per object dir; delete all batch directories."""
+def discard_output(output_dir: Path, object_name: str, timestamp: str, why: str) -> None:
+    """Drop this run's parquet for one object, before the next object starts.
+
+    Called on both outcomes: once the file is safely in Azure, and when the object
+    failed — a failure can leave a truncated file behind, because `combine_parts`
+    closes its writer in a `finally`, and that file was never uploaded.
+
+    The META JSON is left alone: it is a few hundred bytes, it records what this run
+    pushed and how many rows, and `wipe_meta_dirs` clears it at the start of the next
+    run, so it cannot accumulate.
+    """
+    fp = output_dir / object_name / f"_{sanitize_timestamp(timestamp)}.parquet"
+    if fp.exists():
+        size = fp.stat().st_size
+        fp.unlink(missing_ok=True)
+        log.info(f"  Removed {why} parquet: {fp.name} ({size / 1e6:,.1f} MB)")
+
+
+def cleanup_run(output_dir: Path, object_names: Iterable[str], *,
+                keep_latest: bool = False) -> None:
+    """Delete leftover parquets and every batch directory.
+
+    A sweep, not the primary reclaim: each object's parquet is already dropped right
+    after its upload. This catches what an upload failure left behind, and what a run
+    that died partway through never got to.
+
+    `keep_latest` (config `keep_local_copy`) retains the newest parquet per object
+    instead. That was the old unconditional behaviour, and it is what made peak disk
+    two full copies of the dataset — the previous run's, kept here, coexisting with
+    this run's until the next sweep.
+    """
     for obj in object_names:
         obj_dir = output_dir / obj
         if obj_dir.exists():
             pqs = sorted(obj_dir.glob("*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
-            for old in pqs[1:]:
-                log.info(f"  Removed old parquet: {old.name}")
+            for old in (pqs[1:] if keep_latest else pqs):
+                log.info(f"  Removed parquet: {old.name}")
                 old.unlink(missing_ok=True)
     for d in list(output_dir.glob("_parts_*")) + list(output_dir.glob("*_Partition*")):
         if d.is_dir():
