@@ -307,6 +307,8 @@ Objects with a `timestamp_field` run incrementally: each run reads its own lates
 
 Each object's parquet is uploaded and then deleted as soon as it lands, so peak local disk is **one object**, not one dataset. Size the machine for the largest single object plus headroom, not for the total volume.
 
+"One object" is the high-water mark *during* a run, not something retained after it. Once a run finishes **no parquet remains at all** — only the META JSONs, a few hundred bytes each, which are themselves wiped at the start of the next run. The steady state between runs is empty.
+
 Set `keep_local_copy: true` in a source's `config.yaml` to keep the newest parquet per object instead. Nothing in the run path reads it back — the delta watermark comes from the META blob in Azure, and local META is wiped at the start of every run — so it is purely for inspecting output on the machine. It costs a second full copy of the dataset: the kept copy from the previous run coexists with the one being written, so peak becomes **2x the dataset**. Leave it off on anything volume-constrained.
 
 The `_parts_*` scratch directories are removed per object after the combine, and an end-of-run sweep clears anything an upload failure or a crashed run left behind.
