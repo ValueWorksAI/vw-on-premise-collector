@@ -5,13 +5,41 @@ Each source folder must contain a `config.yaml` matching `SourceConfig`. The
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from .secrets import expand
+
+log = logging.getLogger(__name__)
+
+_TRUE = {"true", "yes", "on", "1"}
+_FALSE = {"false", "no", "off", "0", ""}
+
+
+def _as_bool(value: Any, key: str) -> bool:
+    """Coerce a YAML value to a bool, strictly.
+
+    `bool("false")` is True in Python, so a quoted `key: "false"` would otherwise
+    mean the opposite of what it says — and for `keep_local_copy` that is the
+    difference between reclaiming the local disk and doubling what it holds.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in _TRUE:
+            return True
+        if v in _FALSE:
+            return False
+    raise ValueError(f"{key}: expected a boolean, got {value!r}")
 
 
 @dataclass
@@ -61,6 +89,13 @@ class SourceConfig:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         raw = expand(raw)
 
+        # A misspelled key is silently ignored by the explicit gets below, which for
+        # a flag means it quietly takes the default rather than what was intended.
+        unknown = sorted(set(raw) - {f.name for f in fields(cls)})
+        if unknown:
+            log.warning(f"{config_path}: ignoring unrecognised key(s) "
+                        f"{', '.join(unknown)} — check the spelling, they do nothing")
+
         azure = AzureTarget(**raw["azure"])
         objects = [ObjectSpec(**o) for o in raw["objects"]]
         return cls(
@@ -73,5 +108,5 @@ class SourceConfig:
             connection=raw.get("connection", {}) or {},
             max_workers=int(raw.get("max_workers", 5)),
             batch_size=int(raw.get("batch_size", 100_000)),
-            keep_local_copy=bool(raw.get("keep_local_copy", False)),
+            keep_local_copy=_as_bool(raw.get("keep_local_copy"), "keep_local_copy"),
         )
