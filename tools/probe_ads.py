@@ -6,6 +6,11 @@ Read-only. Lists what the login can see from the dictionary's system tables
 unless --no-counts — a COUNT(*) per table. Nothing but names, types and counts leaves
 the machine; no row values are read (except MIN/MAX of delta candidates with --sample).
 
+--fill PATH adds fill rates: per column, how many rows are not NULL and how many carry
+a value (text not blank, number not zero, date after 1900, logical true). The database
+only returns counts (COUNT/SUM aggregates); no row values are read, so the result can
+be shared before any data transfer is agreed. --tables limits the probe to a list.
+
 Usage:
   # Which ODBC drivers can this (64-bit) Python see? No connection needed.
   poetry run python tools/probe_ads.py --drivers
@@ -16,6 +21,10 @@ Usage:
   # Ad hoc, plus a generated config
   poetry run python tools/probe_ads.py --data-directory "\\\\SERVER\\X2\\Daten\\x.add" \
       --user VW-DataCollector --emit-config sources/x2-main/config.yaml --source-name x2-main
+
+  # Row counts and fill rates for selected tables only, uploaded for review
+  poetry run python tools/probe_ads.py --source x2-main --tables @tables.txt \
+      --fill x2-main-fill.csv --out x2-main-schema.json --upload
 
 Password: --password, else ADS_PASSWORD from the environment/.env, else a prompt.
 """
@@ -41,6 +50,23 @@ from common.secrets import expand, load_env  # noqa: E402
 NAME_HINTS = ("modifydt", "modified", "modify", "geaendert", "geändert", "geandert", "aenderung",
               "änderung", "changed", "lastchange", "updated", "mutation", "edit")
 TIMESTAMP_TYPES = {"timestamp", "modtime", "datetime"}
+# Fill-rate rule per ADS type family: (rule label, SQL template for "carries a value").
+# X2 and other ADS applications store an empty date as 1899-12-30, hence "after 1900".
+FILL_RULES = {
+    "text": ("not blank", "SUM(CASE WHEN TRIM({c}) <> '' THEN 1 ELSE 0 END)"),
+    "number": ("non-zero", "SUM(CASE WHEN {c} <> 0 THEN 1 ELSE 0 END)"),
+    "date": ("after 1900", "SUM(CASE WHEN YEAR({c}) > 1900 THEN 1 ELSE 0 END)"),
+    "logical": ("true", "SUM(CASE WHEN {c} = TRUE THEN 1 ELSE 0 END)"),
+}
+TYPE_FAMILY = {
+    **dict.fromkeys(("char", "cichar", "varchar", "nchar", "ncichar", "nvarchar",
+                     "varcharfox"), "text"),
+    **dict.fromkeys(("integer", "short", "double", "curdouble", "money", "numeric",
+                     "autoinc", "rowversion", "longlong", "float"), "number"),
+    **dict.fromkeys(("date", "timestamp", "modtime"), "date"),
+    "logical": "logical",
+}
+FILL_CHUNK = 40  # columns per aggregate query; wide tables take several scans
 SYSTEM_TABLES = ("tables", "columns", "indexes", "relations", "views", "users",
                  "usergroups", "permissions", "dictionary")
 
@@ -138,6 +164,76 @@ def _columns(cur, table: str, sys_cols: dict[str, dict[str, Any]]) -> list[dict[
             for pos, d in enumerate(cur.description, 1)]
 
 
+def _parse_tables(spec: str) -> list[str]:
+    """Comma-separated names, or @file with one name per line (# comments allowed)."""
+    if spec.startswith("@"):
+        text = Path(spec[1:]).read_text(encoding="utf-8-sig")
+        items = [ln.split("#", 1)[0] for ln in text.splitlines()]
+    else:
+        items = spec.split(",")
+    seen: dict[str, str] = {}
+    for item in (i.strip() for i in items):
+        if item and item.lower() not in seen:
+            seen[item.lower()] = item
+    return list(seen.values())
+
+
+def _fill_exprs(col: dict[str, Any]) -> tuple[str, str | None, str]:
+    """(non-null expression, value expression or None, rule label) for one column."""
+    q = ads.quote_ident(col["name"])
+    family = TYPE_FAMILY.get((col.get("type") or "").lower())
+    if family is None:  # memo, blob, binary, time, ...: NULL test only
+        return f"COUNT({q})", None, "not null"
+    rule, tmpl = FILL_RULES[family]
+    return f"COUNT({q})", tmpl.format(c=q), rule
+
+
+def _fill_rates(cur, table: str, cols: list[dict[str, Any]], problems: list[str]) -> list[dict[str, Any]]:
+    """Per-column non-NULL and value counts, computed by the server as aggregates.
+
+    One query per FILL_CHUNK columns. A chunk the server rejects is retried column by
+    column, and a column whose value test fails falls back to the NULL test alone.
+    """
+    def run(exprs: list[str]) -> list[Any]:
+        cur.execute(f"SELECT {', '.join(exprs)} FROM {ads.quote_ident(table)}")
+        return list(cur.fetchone())
+
+    def as_int(v: Any) -> int:
+        return int(v or 0)
+
+    results: list[dict[str, Any]] = []
+    for start in range(0, len(cols), FILL_CHUNK):
+        chunk = cols[start:start + FILL_CHUNK]
+        specs = [_fill_exprs(c) for c in chunk]
+        exprs: list[str] = []
+        for nn, val, _ in specs:
+            exprs += [nn] + ([val] if val else [])
+        try:
+            vals = iter(run(exprs))
+            per_col = [(as_int(next(vals)), as_int(next(vals)) if val else None, rule)
+                       for _, val, rule in specs]
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"fill({table}) chunk at column {start + 1}: {str(e)[:160]}; "
+                            "retrying per column")
+            per_col = []
+            for c, (nn, val, rule) in zip(chunk, specs):
+                try:
+                    got = run([nn] + ([val] if val else []))
+                    per_col.append((as_int(got[0]), as_int(got[1]) if val else None, rule))
+                except Exception:  # noqa: BLE001
+                    try:
+                        per_col.append((as_int(run([nn])[0]), None, "not null"))
+                    except Exception as e2:  # noqa: BLE001
+                        problems.append(f"fill({table}.{c['name']}): {str(e2)[:160]}")
+                        per_col.append((None, None, "failed"))
+        for c, (non_null, filled, rule) in zip(chunk, per_col):
+            results.append({"column": c["name"], "type": c.get("type"),
+                            "non_null": non_null,
+                            "filled": filled if filled is not None else non_null,
+                            "rule": rule})
+    return results
+
+
 def probe(conn, args: argparse.Namespace) -> dict[str, Any]:
     import pyodbc
 
@@ -169,6 +265,14 @@ def probe(conn, args: argparse.Namespace) -> dict[str, Any]:
         names = [r.table_name for r in cur.tables(tableType="TABLE")]
     if args.include:
         names = [n for n in names if args.include.lower() in n.lower()]
+    missing: list[str] = []
+    if args.tables:
+        wanted = _parse_tables(args.tables)
+        by_lower = {n.lower(): n for n in names}
+        missing = [w for w in wanted if w.lower() not in by_lower]
+        names = [by_lower[w.lower()] for w in wanted if w.lower() in by_lower]
+        print(f"  {len(names)} of {len(wanted)} requested tables found"
+              + (f"; not in this dictionary: {', '.join(missing)}" if missing else ""), flush=True)
 
     sys_cols: dict[str, dict[str, dict[str, Any]]] = {}
     for c in sys_tables["columns"]:
@@ -184,7 +288,8 @@ def probe(conn, args: argparse.Namespace) -> dict[str, Any]:
             cols = []
             problems.append(f"columns({name}): {e}")
         row_count = None
-        if not args.no_counts:
+        started = datetime.now()
+        if not args.no_counts or args.fill:
             try:
                 cur.execute(f"SELECT COUNT(*) FROM {ads.quote_ident(name)}")
                 row_count = int(cur.fetchone()[0])
@@ -195,6 +300,13 @@ def probe(conn, args: argparse.Namespace) -> dict[str, Any]:
                "primary_key_index": _clean(t.get("Table_Primary_Key")) or None,
                "comment": _clean(t.get("Comment")) or None,
                "delta_candidates": _delta_candidates(cols)}
+        if args.fill and cols:
+            obj["fill"] = (_fill_rates(cur, name, cols, problems) if row_count else
+                           [{"column": c["name"], "type": c.get("type"), "non_null": 0,
+                             "filled": 0, "rule": "empty table"} for c in cols])
+            obj["probe_seconds"] = round((datetime.now() - started).total_seconds(), 1)
+            print(f"  {name}: {row_count if row_count is not None else '?'} rows, "
+                  f"{len(cols)} columns, {obj['probe_seconds']} s", flush=True)
         if args.sample and obj["delta_candidates"] and row_count:
             col = ads.quote_ident(obj["delta_candidates"][0])
             try:
@@ -204,7 +316,7 @@ def probe(conn, args: argparse.Namespace) -> dict[str, Any]:
             except Exception as e:  # noqa: BLE001
                 problems.append(f"sample({name}): {e}")
         objects.append(obj)
-        if i % 50 == 0:
+        if i % 50 == 0 and not args.fill:
             print(f"  ... {i}/{len(names)} tables", flush=True)
 
     def strip_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -217,6 +329,7 @@ def probe(conn, args: argparse.Namespace) -> dict[str, Any]:
         "server": info,
         "clock": clock,
         "objects": objects,
+        "tables_missing": missing,
         "indexes": strip_rows(sys_tables["indexes"]),
         "relations": strip_rows(sys_tables["relations"]),
         "views": strip_rows(sys_tables["views"]),
@@ -252,6 +365,52 @@ def print_summary(data: dict[str, Any]) -> None:
         print(f"{o['name']:<40} {rows:>12} {len(o['columns']):>5}  {cand}")
     if len(objs) > 60:
         print(f"... {len(objs) - 60} more (see --out)")
+    if data.get("tables_missing"):
+        print(f"\nNot in this dictionary ({len(data['tables_missing'])}): "
+              + ", ".join(data["tables_missing"]))
+    filled = [o for o in objs if o.get("fill")]
+    if filled:
+        secs = sum(o.get("probe_seconds") or 0 for o in filled)
+        used = sum(1 for o in filled for fc in o["fill"] if fc["filled"])
+        cols = sum(len(o["fill"]) for o in filled)
+        print(f"Fill:      {used} of {cols} columns carry values across {len(filled)} tables "
+              f"({secs:.0f} s of queries)")
+
+
+def write_fill_csv(data: dict[str, Any], path: Path) -> None:
+    """One row per column: counts and percentages only, never values."""
+    import csv
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["table", "rows", "column", "position", "type", "non_null", "filled",
+                     "filled_pct", "rule"])
+        for o in data["objects"]:
+            rows = o.get("row_count")
+            for pos, fc in enumerate(o.get("fill") or [], 1):
+                pct = (round(100 * fc["filled"] / rows, 1)
+                       if rows and fc["filled"] is not None else "")
+                w.writerow([o["name"], rows, fc["column"], pos, fc["type"], fc["non_null"],
+                            fc["filled"], pct, fc["rule"]])
+        for name in data.get("tables_missing") or []:
+            w.writerow([name, "", "", "", "", "", "", "", "table not in this dictionary"])
+
+
+def upload_results(paths: list[Path], label: str, container: str) -> None:
+    """Copy the probe files to <container>/_probe/<label>/<UTC time>/ with the .env SAS."""
+    from datetime import timezone
+    from common import azure
+
+    url = os.getenv("AZURE_STORAGE_URL")
+    sas = os.getenv("AZURE_STORAGE_SAS_TOKEN")
+    if not url or not sas:
+        print("[WARN] --upload: AZURE_STORAGE_URL / AZURE_STORAGE_SAS_TOKEN not set; skipped")
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-") or "ads"
+    base = f"{url.rstrip('/')}/{container}/_probe/{safe}/{stamp}"
+    for path in paths:
+        azure.upload_file(path, f"{base}/{path.name}", sas)
+    print(f"Uploaded {len(paths)} file(s) to {container}/_probe/{safe}/{stamp}/")
 
 
 def build_config(data: dict[str, Any], args: argparse.Namespace) -> str:
@@ -326,6 +485,12 @@ def main() -> int:
     p.add_argument("--env-prefix", help="Env var prefix for username/password (default <SOURCE>_ADS)")
     p.add_argument("--prefix", help="Blob prefix for the generated config (default raw/<source>)")
     p.add_argument("--min-rows", type=int, default=1, help="With --emit-config: omit smaller tables")
+    p.add_argument("--tables", help="Only these tables: comma-separated, or @file with one per line")
+    p.add_argument("--fill", metavar="CSV", help="Write per-column fill rates (counts only) here")
+    p.add_argument("--upload", action="store_true",
+                   help="Copy --out/--fill files to <container>/_probe/<source>/<time>/ "
+                        "using AZURE_STORAGE_URL and AZURE_STORAGE_SAS_TOKEN from .env")
+    p.add_argument("--container", default="warehouse", help="Container for --upload")
     args = p.parse_args()
 
     if args.drivers:
@@ -347,6 +512,8 @@ def main() -> int:
     args.user_display = conn_cfg["username"]
     if args.emit_config and not args.source_name:
         p.error("--emit-config needs --source-name (or --source)")
+    if args.sample and args.upload:
+        p.error("--sample reads MIN/MAX values; not combined with --upload")
 
     print(f"Connecting to {conn_cfg['data_directory']} as {conn_cfg['username']} "
           f"via {conn_cfg.get('driver', ads.DEFAULT_DRIVER)} (remote server)...")
@@ -368,10 +535,21 @@ def main() -> int:
         Path(args.emit_config).parent.mkdir(parents=True, exist_ok=True)
         Path(args.emit_config).write_text(build_config(data, args), encoding="utf-8")
         print(f"\nConfig written to {args.emit_config} — review the table selection before use.")
+    written: list[Path] = []
     if args.out:
         Path(args.out).write_text(json.dumps(data, indent=2, default=str, ensure_ascii=False),
                                   encoding="utf-8")
         print(f"Full schema written to {args.out}")
+        written.append(Path(args.out))
+    if args.fill:
+        write_fill_csv(data, Path(args.fill))
+        print(f"Fill rates written to {args.fill}")
+        written.append(Path(args.fill))
+    if args.upload:
+        if not written:
+            p.error("--upload needs --out and/or --fill")
+        label = args.source_name or Path(str(conn_cfg["data_directory"])).stem
+        upload_results(written, label, args.container)
     return 0
 
 
