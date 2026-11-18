@@ -38,8 +38,8 @@ from common import ads  # noqa: E402
 from common.secrets import expand, load_env  # noqa: E402
 
 # Column-name fragments that suggest a last-changed column, best first.
-NAME_HINTS = ("geaendert", "geändert", "geandert", "aenderung", "änderung", "modified",
-              "changed", "lastchange", "updated", "mutation", "edit")
+NAME_HINTS = ("modifydt", "modified", "modify", "geaendert", "geändert", "geandert", "aenderung",
+              "änderung", "changed", "lastchange", "updated", "mutation", "edit")
 TIMESTAMP_TYPES = {"timestamp", "modtime", "datetime"}
 SYSTEM_TABLES = ("tables", "columns", "indexes", "relations", "views", "users",
                  "usergroups", "permissions", "dictionary")
