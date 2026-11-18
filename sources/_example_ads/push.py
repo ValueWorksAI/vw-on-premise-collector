@@ -14,6 +14,7 @@ time zone before delta is switched on.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any, Iterable
 
@@ -22,6 +23,7 @@ from common.config import ObjectSpec
 from common.source import Source
 
 FETCH_BATCH_SIZE = 10_000
+log = logging.getLogger(__name__)
 
 
 def _as_local_naive(iso: str) -> datetime:
@@ -60,6 +62,13 @@ class ADSSource(Source):
         if where:
             sql += f" WHERE {where}"
 
+        conn_cfg = self.config.connection
+        mode = str(obj.extra.get("blob_handling") or conn_cfg.get("blob_handling") or "text")
+        if mode not in ads.BLOB_MODES:
+            raise ValueError(f"blob_handling must be one of {ads.BLOB_MODES}, got {mode!r}")
+        encoding = str(conn_cfg.get("blob_encoding") or "cp1252")
+        dropped: dict[str, int] = {}
+
         cursor = self.conn.cursor()
         try:
             cursor.execute(sql, tuple(params))
@@ -69,9 +78,18 @@ class ADSSource(Source):
                 if not rows:
                     break
                 for row in rows:
-                    yield dict(zip(col_names, row))
+                    rec = dict(zip(col_names, row))
+                    for k, v in rec.items():
+                        if isinstance(v, (bytes, bytearray, memoryview)):
+                            rec[k] = ads.blob_value(v, mode, encoding)
+                            if rec[k] is None:
+                                dropped[k] = dropped.get(k, 0) + 1
+                    yield rec
         finally:
             cursor.close()
+        if dropped:
+            log.info(f"[{obj.name}] binary values left empty (blob_handling=text): "
+                     + ", ".join(f"{k}={n}" for k, n in sorted(dropped.items())))
 
 
 SOURCE_CLASS = ADSSource

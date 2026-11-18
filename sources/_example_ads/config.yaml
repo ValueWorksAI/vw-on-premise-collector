@@ -28,6 +28,11 @@ connection:
   # 2 = remote server only. Never 1 (Advantage Local Server) against a live database.
   server_types: 2
   # char_type: ANSI          # set only if umlauts come out wrong
+  # Binary (BLOB) columns: text = decode text-like values (UTF-8, else blob_encoding),
+  # leave real binary data (images, compressed files) empty; base64 = keep everything
+  # as base64 strings; keep = raw bytes (breaks consumers that read every column as text).
+  blob_handling: text
+  blob_encoding: cp1252
 
 objects:
   - name: SomeTable

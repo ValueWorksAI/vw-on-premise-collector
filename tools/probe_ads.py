@@ -282,6 +282,10 @@ def build_config(data: dict[str, Any], args: argparse.Namespace) -> str:
         f"  password: ${{env:{envp}_PASSWORD}}",
         f"  driver: {data['server'].get('driver_name_used') or ads.DEFAULT_DRIVER}",
         "  server_types: 2",
+        "  # Binary columns: text = decode text-like values, leave images/compressed data empty;",
+        "  # base64 = keep all as base64 strings; keep = raw bytes.",
+        "  blob_handling: text",
+        "  blob_encoding: cp1252",
         "",
         "objects:",
     ]

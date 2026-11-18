@@ -76,6 +76,38 @@ def connect(c: dict[str, Any]):
     return conn
 
 
+BLOB_MODES = ("text", "base64", "keep")
+
+
+def blob_value(value: bytes | bytearray | memoryview, mode: str = "text",
+               encoding: str = "cp1252") -> str | bytes | None:
+    """Turn a binary column value into something downstream can store as text.
+
+    Applications on ADS keep free text in BLOB columns (notes, letter heads, rich-text
+    formats) next to real binary data (JPEGs, zlib print copies). Raw bytes in parquet
+    break consumers that cast every column to a string, so by default:
+
+      text    value without NUL bytes -> decoded (UTF-8, else `encoding`);
+              anything else (images, compressed data) -> None
+      base64  every value -> base64 string (lossless, larger)
+      keep    leave bytes as they are (parquet binary column)
+    """
+    b = bytes(value)
+    if mode == "keep":
+        return b
+    if mode == "base64":
+        import base64
+        return base64.b64encode(b).decode("ascii")
+    if b"\x00" in b:
+        return None
+    for enc in ("utf-8", encoding):
+        try:
+            return b.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return b.decode("latin-1")
+
+
 def quote_ident(name: str) -> str:
     """Quote a table or column name for ADS SQL.
 
