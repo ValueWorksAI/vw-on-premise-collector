@@ -97,6 +97,40 @@ def _delta_candidates(columns: list[dict[str, Any]]) -> list[str]:
     return [name for s, name in sorted((x for x in ranked if x[0] is not None))]
 
 
+def _columns(cur, table: str, sys_cols: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Column list via the ODBC catalog (SQLColumns).
+
+    The ADS driver answers with ODBC 2.x result names (PRECISION/SCALE, upper case,
+    no ORDINAL_POSITION), so rows are read by lower-cased description name rather than
+    pyodbc's ODBC 3 attribute names. Falls back to an empty SELECT's description.
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        cur.columns(table=table)
+        names = [d[0].lower() for d in cur.description]
+        rows = [dict(zip(names, r)) for r in cur.fetchall()]
+    except Exception:  # noqa: BLE001
+        rows = []
+    for pos, r in enumerate(rows, 1):
+        col = str(r.get("column_name") or "").strip()
+        sc = sys_cols.get(col.lower(), {})
+        out.append({
+            "name": col,
+            "type": str(r.get("type_name") or "").strip(),
+            "size": r.get("column_size", r.get("precision")),
+            "decimals": r.get("decimal_digits", r.get("scale")),
+            "nullable": bool(r.get("nullable")),
+            "position": r.get("ordinal_position") or pos,
+            "comment": _clean(sc.get("Comment")) or None,
+        })
+    if out:
+        return out
+    cur.execute(f"SELECT * FROM {ads.quote_ident(table)} WHERE 1 = 0")
+    return [{"name": d[0], "type": getattr(d[1], "__name__", str(d[1])), "size": d[3],
+             "decimals": d[5], "nullable": bool(d[6]), "position": pos, "comment": None}
+            for pos, d in enumerate(cur.description, 1)]
+
+
 def probe(conn, args: argparse.Namespace) -> dict[str, Any]:
     import pyodbc
 
@@ -137,15 +171,10 @@ def probe(conn, args: argparse.Namespace) -> dict[str, Any]:
     tmeta = {str(r.get("Name") or "").strip().lower(): r for r in sys_tables["tables"]}
     objects = []
     for i, name in enumerate(sorted(names, key=str.lower), 1):
-        cols = []
         try:
-            for c in cur.columns(table=name):
-                sc = sys_cols.get(name.lower(), {}).get(c.column_name.lower(), {})
-                cols.append({"name": c.column_name, "type": c.type_name, "size": c.column_size,
-                             "decimals": c.decimal_digits, "nullable": bool(c.nullable),
-                             "position": c.ordinal_position,
-                             "comment": _clean(sc.get("Comment")) or None})
+            cols = _columns(cur, name, sys_cols.get(name.lower(), {}))
         except Exception as e:  # noqa: BLE001
+            cols = []
             problems.append(f"columns({name}): {e}")
         row_count = None
         if not args.no_counts:
@@ -169,7 +198,7 @@ def probe(conn, args: argparse.Namespace) -> dict[str, Any]:
                 problems.append(f"sample({name}): {e}")
         objects.append(obj)
         if i % 50 == 0:
-            print(f"  ... {i}/{len(names)} tables", file=sys.stderr)
+            print(f"  ... {i}/{len(names)} tables", flush=True)
 
     def strip_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [{k: _clean(v) for k, v in r.items()} for r in rows]
