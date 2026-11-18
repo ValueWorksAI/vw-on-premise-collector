@@ -1,0 +1,39 @@
+# Template for an on-premise Advantage Database Server (ADS) source.
+# Copy this folder to sources/<your-source>/ and edit, or let
+#   poetry run python tools/probe_ads.py ... --emit-config sources/<your-source>/config.yaml
+# write a complete one. Requires pyodbc (poetry install --with mssql) and the 64-bit
+# "Advantage StreamlineSQL ODBC" driver.
+name: example-ads
+output_dir: C:\output\example-ads
+max_workers: 1
+keep_local_copy: false
+
+azure:
+  storage_url: ${env:AZURE_STORAGE_URL}
+  sas_token:   ${env:AZURE_STORAGE_SAS_TOKEN}
+  container:   warehouse
+  prefix:      raw/example-ads
+
+partition_field: null
+partitions: []
+
+connection:
+  # Path of the .add data dictionary as the ADS server sees it. A UNC path names the
+  # server (\\SERVER\share\...\x.add); a local path works when the collector runs on
+  # the database server itself.
+  data_directory: ${env:EXAMPLE_ADS_DATA_DIRECTORY}
+  username: ${env:EXAMPLE_ADS_USERNAME}
+  password: ${env:EXAMPLE_ADS_PASSWORD}
+  driver: Advantage StreamlineSQL ODBC
+  # 2 = remote server only. Never 1 (Advantage Local Server) against a live database.
+  server_types: 2
+  # char_type: ANSI          # set only if umlauts come out wrong
+
+objects:
+  - name: SomeTable
+    endpoint: SOMETABLE            # table name as listed in the data dictionary
+    timestamp_field: null          # e.g. a "changed at" timestamp; null => full refresh
+    partition_scoped: false
+    extra: {}
+      # columns: [ID, NAME]        # omit for SELECT *
+      # where: "\"DATUM\" >= '2024-01-01'"
