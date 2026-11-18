@@ -100,10 +100,14 @@ def _delta_candidates(columns: list[dict[str, Any]]) -> list[str]:
 def _columns(cur, table: str, sys_cols: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     """Column list via the ODBC catalog (SQLColumns).
 
-    The ADS driver answers with ODBC 2.x result names (PRECISION/SCALE, upper case,
-    no ORDINAL_POSITION), so rows are read by lower-cased description name rather than
-    pyodbc's ODBC 3 attribute names. Falls back to an empty SELECT's description.
+    The ADS driver names its result columns its own way (`columnname`, `typename`,
+    `precision`, `scale`, ODBC 2 style) instead of ODBC 3's `column_name`/`type_name`,
+    so rows are read by description name with both spellings accepted. Falls back to
+    an empty SELECT's description.
     """
+    def pick(r: dict[str, Any], *keys: str) -> Any:
+        return next((r[k] for k in keys if r.get(k) is not None), None)
+
     out: list[dict[str, Any]] = []
     try:
         cur.columns(table=table)
@@ -112,16 +116,19 @@ def _columns(cur, table: str, sys_cols: dict[str, dict[str, Any]]) -> list[dict[
     except Exception:  # noqa: BLE001
         rows = []
     for pos, r in enumerate(rows, 1):
-        col = str(r.get("column_name") or "").strip()
+        col = str(pick(r, "column_name", "columnname") or "").strip()
+        if not col:
+            out = []
+            break
         sc = sys_cols.get(col.lower(), {})
         out.append({
             "name": col,
-            "type": str(r.get("type_name") or "").strip(),
-            "size": r.get("column_size", r.get("precision")),
-            "decimals": r.get("decimal_digits", r.get("scale")),
-            "nullable": bool(r.get("nullable")),
-            "position": r.get("ordinal_position") or pos,
-            "comment": _clean(sc.get("Comment")) or None,
+            "type": str(pick(r, "type_name", "typename") or "").strip(),
+            "size": pick(r, "column_size", "precision"),
+            "decimals": pick(r, "decimal_digits", "scale"),
+            "nullable": bool(pick(r, "nullable")),
+            "position": pick(r, "ordinal_position") or pos,
+            "comment": _clean(sc.get("Comment")) or _clean(pick(r, "remarks")) or None,
         })
     if out:
         return out
