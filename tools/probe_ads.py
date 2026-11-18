@@ -26,7 +26,8 @@ Usage:
   poetry run python tools/probe_ads.py --source x2-main --tables @tables.txt \
       --fill x2-main-fill.csv --out x2-main-schema.json --upload
 
-Password: --password, else ADS_PASSWORD from the environment/.env, else a prompt.
+User: --user, else ADS_USERNAME. Password: --password, else ADS_PASSWORD (environment
+or .env), else a prompt.
 """
 from __future__ import annotations
 
@@ -503,8 +504,10 @@ def main() -> int:
         conn_cfg = expand(yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["connection"])
         args.source_name = args.source_name or args.source
     else:
+        args.user = args.user or os.getenv("ADS_USERNAME")
         if not args.data_directory or not args.user:
-            p.error("--data-directory and --user are required (or use --source / --drivers)")
+            p.error("--data-directory and --user (or ADS_USERNAME) are required "
+                    "(or use --source / --drivers)")
         password = args.password or os.getenv("ADS_PASSWORD") or getpass.getpass("ADS password: ")
         conn_cfg = {"data_directory": args.data_directory, "username": args.user,
                     "password": password, "driver": args.driver}
