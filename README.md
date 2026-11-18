@@ -11,6 +11,7 @@ common/             shared utilities (config, azure upload, parquet, delta, secr
 sources/
   _example/         template for new HTTP/API sources
   _example_mssql/   template for Microsoft SQL Server sources (pyodbc)
+  _example_ads/     template for Advantage Database Server sources (pyodbc + Advantage ODBC)
 tools/              maintenance & validation scripts
 orchestrator.py     entry point: discovers sources, runs them, aggregates results
 run.ps1             thin PowerShell launcher for Windows Task Scheduler
@@ -170,6 +171,34 @@ Orchestrator exit codes: `0` all sources succeeded, `1` at least one source fail
 | AzCopy fails with a TLS/certificate error | Proxy doing SSL inspection — see step 6 |
 | Works interactively, `LastTaskResult` non-zero | Service account cannot reach Python (Store build) or `.env` (ACL) |
 | Every run reports full-refresh | SAS lacks Read+List, so META cannot be read back — see [Delta refresh](#delta-refresh) |
+
+## Advantage Database Server (ADS) sources
+
+ADS keeps each table as its own file next to a data dictionary (`.add`). The collector
+connects to the dictionary through the ADS **server** with the 64-bit "Advantage
+StreamlineSQL ODBC" driver (`adsodbc_x86_64.exe`, from the application vendor; SAP only
+offers it behind an S-user login). `common/ads.py` refuses `server_types` that include
+the Advantage Local Server, which would open the live table files directly.
+
+`tools/setup_windows.ps1 -AdsDriverInstaller <path>` installs the driver silently. The
+InstallShield wrapper needs `/s /b"<folder>" /v"/qn"`; without `/b` it returned 1619.
+
+```powershell
+poetry run python tools\probe_ads.py --drivers
+poetry run python tools\probe_ads.py --data-directory "\\SERVER\share\x.add" --user <user> `
+    --source-name <name> --env-prefix <PREFIX> --emit-config sources\<name>\config.yaml --out schema.json
+copy sources\_example_ads\push.py sources\<name>\
+```
+
+Notes:
+
+- The driver reports its catalog with its own result names (`columnname`, `typename`),
+  so `probe_ads.py` reads SQLColumns rows by name and falls back to an empty SELECT.
+- `data_directory` is the dictionary path as the ADS server sees it: a UNC path that
+  names the server, or a local path when the collector runs on the database server.
+- Some ADS applications store a change stamp as separate date and time columns. The
+  delta filter compares one column, so such objects stay on full refresh until a
+  combined predicate exists.
 
 ## Setup — Ubuntu / Linux
 
