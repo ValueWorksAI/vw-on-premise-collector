@@ -339,7 +339,7 @@ Some tables only point at files, e.g. a document table whose rows name scanned i
 ```yaml
   - name: DOCUMENTS
     endpoint: DOCUMENTS
-    timestamp_field: null
+    timestamp_field: null                        # required: full refresh, see below
     partition_scoped: false
     extra:
       columns: [ID, FOLDER, FILE_NAME]
@@ -349,14 +349,19 @@ Some tables only point at files, e.g. a document table whose rows name scanned i
         path_columns: [FOLDER, FILE_NAME]        # joined in this order; the last is the file name
         prefix: files/my-source                  # optional; default <azure.prefix>/_files/<object>
         max_file_mb: 100                         # optional; larger files are skipped and counted
+        min_age_minutes: 10                      # optional; younger files wait for the next run
+        max_minutes: 60                          # optional; time budget for the copy per run
 ```
 
-- **Opt-in and bounded.** Nothing outside `base_dir` is read: absolute paths (`C:\…`, `\\server\…`) and `..` in a row are skipped and counted. The `where` and `columns` of the object decide which rows, and so which files, are in scope. With `columns` set, the path columns must be among them.
-- **New files only.** Each run lists the target prefix once and uploads only the files not there yet: the first run copies everything, later runs only what is new. A blob is never overwritten (`If-None-Match: *`) and never deleted, so a file changed or removed on the host keeps its first copy in storage. Each upload carries Content-MD5, so a damaged body is rejected by the service.
-- **After the tables.** The paths are read back from the object's parquet before the local copy is dropped, but the files themselves are copied at the end of the source's run, so a large first copy cannot delay the tables behind it. Run the first copy by hand during the day if it is large.
-- **In the run report.** The object's entry in `_runs/` gets a `files` block: `named`, `already_in_storage`, `uploaded`, `uploaded_mb`, `missing_on_host`, `too_large`, `failed`, `not_attempted` and `skipped_*`. A file the rows name but the host does not have is counted, not an error. A failed upload (after 3 attempts) marks the object failed, so the run exits `1`, and the next run sends the file again. After 20 failed files the rest is left for the next run.
+- **Opt-in and bounded.** Nothing outside `base_dir` is read. Absolute and UNC paths, a `:` anywhere (a drive letter in a later segment would restart the path on that drive) and `..`-like segments skip the row; every joined path is also checked to lie inside `base_dir`. Path parts are right-stripped (CHAR columns arrive padded), and a single leading separator stays relative. The object's `where` and `columns` decide which rows, and so which files, are in scope; path columns are matched case-insensitively.
+- **New files only, never overwritten.** Each run lists the target prefix once (paged, retried) and uploads only the files not there yet. Uploads are streamed with Content-MD5 and `If-None-Match: *`, so a blob is never overwritten and never deleted: a file changed or removed on the host keeps its first copy. Files modified within `min_age_minutes` wait for a later run, so a scan still being written is not stored half-done.
+- **Full refresh only.** Anything a run does not send (failed, unreadable, too recent, over the time budget) is picked up by a later run because it is still missing from the listing. That needs every run to name every file, so `extra.files` on an object with a `timestamp_field` is refused at load.
+- **After the tables, within a budget.** The paths are read back from the object's parquet before the local copy is dropped. The files are copied only after every table of the source has landed, the run report has been published and the source connection is closed, so a large first copy delays nothing but the source's exit. `max_minutes` caps the copy per run; the rest follows next run, so a first copy of many files spreads over several nights by itself.
+- **In the run report.** The object's `_runs/` entry gets a `files` block (the report is republished once the copy is done): `status` (`ok`, `incomplete` = time budget used up, `failed`), `named`, `already_in_storage`, `uploaded`, `uploaded_mb`, `missing_on_host`, `unreadable`, `too_large`, `too_recent`, `failed`, `not_attempted`, `skipped_*`. The table's own `status` and `records` are unaffected. Files missing on the host or locked are counted, not errors. An upload that fails 3 times sets `files.status` to `failed` and the run exits `1`; after 20 such failures in a row the rest is left for the next run. Local read errors never count toward that cap.
 - **Permissions.** Needs the SAS's List permission in addition to Create + Write. Without List the copy refuses to start rather than sending everything again.
-- **Choose a prefix outside the table folders** (e.g. `files/<source>`) when the files are many. The default `_files/` sits under the source's prefix: a reader that picks parquet by extension ignores the files there, but still has to page through them when it lists the prefix.
+- **One run per source.** Every run holds an OS lock on `<output_dir>/.collector.lock`. A second run of the same source while one is still going (a manual copy overlapping the scheduled task) exits `1` without touching anything. The lock goes away with the process, so a crash never leaves it stale.
+- **Choose a prefix outside the table folders** (e.g. `files/<source>`) when the files are many. The default `_files/` sits under the source's prefix: a reader that picks parquet by extension ignores the files there, but still has to page through them when it lists the prefix. Prefixes of two objects must not overlap.
+- **Long paths.** On Windows, paths of 248+ characters are opened in the extended-length form (`\\?\`), so they work without `LongPathsEnabled`.
 
 ## Local disk usage
 

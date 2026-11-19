@@ -13,12 +13,15 @@ Optional overrides:
 The base class owns the run loop: per object, resolve delta bound, fetch each
 partition in batches, combine, write META, upload to Azure, then drop the local
 parquet again before starting the next object. Objects with `extra.files` also get
-the files their rows point to copied, once every table is done (common/files.py).
+the files their rows point to copied, once every table is done and reported
+(common/files.py). One run per source at a time: a lock in `output_dir` refuses a
+second run while the first is still going.
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -42,7 +45,9 @@ class Source(ABC):
         # table is collected rather than after all of them.
         self._file_specs = {o.name: spec for o in config.objects
                             if (spec := files.FileSpec.parse(o, config.azure.prefix))}
-        self._pending_files: dict[str, tuple[list[str], dict[str, int]]] = {}
+        files.check_prefixes(self._file_specs, config.azure.prefix)
+        # Per object: {"paths": [...], "skipped": {...}} or {"error": "..."}.
+        self._pending_files: dict[str, dict[str, Any]] = {}
 
     # ----- required -----
     @abstractmethod
@@ -89,11 +94,39 @@ class Source(ABC):
             return None, upper, "full-refresh / no timestamp_upper_bound in raw META", False
         return lower, upper, "delta-refresh", True
 
+    def close(self) -> None:
+        """Release the source connection before the file copy, which needs none.
+
+        Default: close `self.conn` if the source keeps one there (the SQL templates
+        do). Override for sources that hold other resources.
+        """
+        conn = getattr(self, "conn", None)
+        if conn is not None and hasattr(conn, "close"):
+            try:
+                conn.close()
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"[{self.config.name}] closing the source connection failed: {e}")
+            self.conn = None
+
     # ----- run loop -----
     def run(self) -> int:
-        """Returns process exit code. 0 on success, 1 if any object failed."""
+        """Returns process exit code. 0 on success, 1 if any object or file copy
+        failed, or if another run of this source is still in progress."""
         out_dir = self.config.output_dir
         out_dir.mkdir(parents=True, exist_ok=True)
+        lock = _acquire_lock(out_dir)
+        if lock is None:
+            # A second run would sweep the first one's batch files mid-collection and
+            # upload truncated tables with an advanced watermark.
+            log.error(f"[{self.config.name}] another run of this source is still in "
+                      f"progress ({out_dir / LOCK_NAME}); not starting a second one")
+            return 1
+        try:
+            return self._run_locked(out_dir)
+        finally:
+            _release_lock(lock)
+
+    def _run_locked(self, out_dir: Path) -> int:
         log.info(f"[{self.config.name}] wiping META dirs in {out_dir}")
         parquet.wipe_meta_dirs(out_dir)
 
@@ -134,25 +167,34 @@ class Source(ABC):
                 # newest file on disk misrepresenting the last successful push.
                 parquet.discard_output(out_dir, obj.name, self.collection_start, "failed")
 
-        # Files last: a first copy of thousands of files must not hold up the tables.
-        for r in results:
-            pending = self._pending_files.pop(r["object"], None)
-            if pending is not None and r["status"] == "ok":
-                self._copy_files(r, *pending)
-
         log.info(f"[{self.config.name}] sweeping local leftovers")
         parquet.cleanup_run(out_dir, [o.name for o in self.config.objects],
                             keep_latest=self.config.keep_local_copy)
 
-        failed = [r for r in results if r["status"] == "failed"]
+        # Report the tables before any file is copied: a long first copy must not hold
+        # the report back, and a run stopped during the copy still leaves one.
         self._publish_run_report(results)
+        if self._pending_files:
+            self.close()
+            for r in results:
+                pending = self._pending_files.pop(r["object"], None)
+                if pending is not None and r["status"] == "ok":
+                    self._copy_files(r, pending)
+            self._publish_run_report(results)   # same name, now with the files blocks
 
+        failed = [r for r in results if r["status"] == "failed"]
+        files_failed = [r for r in results if r.get("files", {}).get("status") == "failed"]
         ok = len(results) - len(failed)
-        if failed:
-            log.error(f"[{self.config.name}] {ok}/{len(results)} objects collected; "
-                      f"{len(failed)} failed:")
-            for r in failed:
-                log.error(f"    {r['object']}: {r['error']}")
+        if failed or files_failed:
+            if failed:
+                log.error(f"[{self.config.name}] {ok}/{len(results)} objects collected; "
+                          f"{len(failed)} failed:")
+                for r in failed:
+                    log.error(f"    {r['object']}: {r['error']}")
+            for r in files_failed:
+                f = r["files"]
+                log.error(f"    {r['object']} files: " + (f.get("error") or
+                          f"{f['failed']} upload(s) failed, {f['not_attempted']} not attempted"))
             return 1
         log.info(f"[{self.config.name}] done, {ok} object(s), "
                  f"{sum(r['records'] for r in results):,} records")
@@ -173,6 +215,8 @@ class Source(ABC):
             "objects_total": len(results),
             "objects_ok": len(results) - len(failed),
             "objects_failed": len(failed),
+            "objects_files_failed": sum(1 for r in results
+                                        if r.get("files", {}).get("status") == "failed"),
             "records_total": sum(r.get("records", 0) for r in results),
             "results": results,
         }
@@ -189,26 +233,22 @@ class Source(ABC):
         finally:
             fp.unlink(missing_ok=True)
 
-    def _copy_files(self, result: dict[str, Any], paths: list[str],
-                    skipped: dict[str, int]) -> None:
-        """Copy one object's files and record the counts in its run-report entry.
+    def _copy_files(self, result: dict[str, Any], pending: dict[str, Any]) -> None:
+        """Copy one object's files into its run-report entry as a `files` block.
 
-        The table itself is already uploaded; a failed copy still marks the object
-        failed, so the run exits non-zero and the report says why.
+        The table's own status and record count are left alone: it landed. A failed
+        copy sets `files.status` to failed, which makes the run exit non-zero.
         """
         name = result["object"]
+        if "error" in pending:
+            result["files"] = {"status": "failed", "error": pending["error"]}
+            return
         try:
-            summary = files.copy_missing(self._file_specs[name], self.config.azure,
-                                         paths, skipped, name)
+            result["files"] = files.copy_missing(self._file_specs[name], self.config.azure,
+                                                 pending["paths"], pending["skipped"], name)
         except Exception as e:  # noqa: BLE001
             log.error(f"[{name}] file copy FAILED: {e}")
-            result.update(status="failed", error=f"files: {type(e).__name__}: {e}")
-            return
-        result["files"] = summary
-        if summary["failed"] or summary["not_attempted"]:
-            result.update(status="failed",
-                          error=f"files: {summary['failed']} upload(s) failed, "
-                                f"{summary['not_attempted']} not attempted")
+            result["files"] = {"status": "failed", "error": f"{type(e).__name__}: {e}"}
 
     def _run_object(self, obj: ObjectSpec) -> tuple[int, str]:
         lower, upper, refresh_type, is_delta = self.resolve_delta_bound(obj)
@@ -269,7 +309,13 @@ class Source(ABC):
         if spec is not None:
             # Only the path columns, after the table is safely up and before the
             # parquet is dropped. The files themselves follow at the end of run().
-            self._pending_files[obj.name] = files.relative_paths(fp, spec)
+            # A failure here belongs to the files, not to the table that landed.
+            try:
+                paths, skipped = files.relative_paths(fp, spec)
+                self._pending_files[obj.name] = {"paths": paths, "skipped": skipped}
+            except Exception as e:  # noqa: BLE001
+                log.error(f"[{obj.name}] file paths could not be read: {e}")
+                self._pending_files[obj.name] = {"error": f"{type(e).__name__}: {e}"}
         if not self.config.keep_local_copy:
             parquet.discard_output(out_dir, obj.name, self.collection_start, "uploaded")
         return total, refresh_type
@@ -299,6 +345,45 @@ class Source(ABC):
             f"{target.base_url}/{obj.name}/META/{meta_fp.name}",
             target.sas_token,
         )
+
+
+LOCK_NAME = ".collector.lock"
+
+
+def _acquire_lock(out_dir: Path):
+    """Exclusive, non-blocking lock on <output_dir>/.collector.lock, or None if held.
+
+    An OS lock rather than a marker file: it goes away with the process, so a crashed
+    or killed run never leaves a stale lock behind.
+    """
+    fh = open(out_dir / LOCK_NAME, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
+def _release_lock(fh) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        fh.close()
 
 
 def load_source(source_dir: Path, mode: str) -> Source:
