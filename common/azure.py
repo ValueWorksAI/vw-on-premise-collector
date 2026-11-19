@@ -1,19 +1,27 @@
 """Azure Blob Storage helpers: AzCopy upload, blob list/download via REST."""
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
 import os
 import shutil
 import subprocess
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
+from urllib.parse import quote, urlencode
 
 import requests
 
 from .config import AzureTarget
 
 log = logging.getLogger(__name__)
+
+# Pinned so single-shot PUTs above 256 MiB are accepted (2019-12-12+) and the
+# behaviour does not shift with whatever the SAS's own `sv` happens to be.
+BLOB_API_VERSION = "2021-08-06"
 
 
 def _azcopy() -> str:
@@ -59,6 +67,105 @@ def list_blobs(target: AzureTarget, prefix: str) -> list[str]:
         return []
     root = ET.fromstring(resp.content)
     return [b.text for b in root.findall(".//Blobs/Blob/Name") if b.text]
+
+
+LIST_ATTEMPTS = 3
+LIST_RETRY_DELAY = 10.0
+# Connect / read timeouts. The read timeout applies per socket operation, and a
+# streamed body is sent block by block, so a slow line never hits a whole-upload limit.
+TIMEOUT = (30, 300)
+
+
+def _list_page(http: Any, url: str, where: str) -> requests.Response:
+    """One listing page, retried on connection errors, timeouts, 408, 429 and 5xx."""
+    last = ""
+    for i in range(LIST_ATTEMPTS):
+        try:
+            resp = http.get(url, headers={"x-ms-version": BLOB_API_VERSION}, timeout=TIMEOUT)
+        except requests.RequestException as e:
+            last = type(e).__name__
+        else:
+            if resp.status_code == 200:
+                return resp
+            last = f"HTTP {resp.status_code} {resp.headers.get('x-ms-error-code', '')}".rstrip()
+            if resp.status_code not in (408, 429) and resp.status_code < 500:
+                break
+        if i < LIST_ATTEMPTS - 1:
+            log.warning(f"listing {where} failed ({last}), retrying")
+            time.sleep(LIST_RETRY_DELAY * (2 ** i))
+    raise RuntimeError(f"listing {where} failed: {last}")
+
+
+def list_blob_names(target: AzureTarget, prefix: str,
+                    session: requests.Session | None = None) -> list[str]:
+    """Every blob name under <container>/<prefix>/, following continuation markers.
+
+    Unlike `list_blobs` this raises on any failure: callers use the answer to decide
+    what still has to be uploaded, so a failed call must not look like an empty
+    folder. Errors never carry the request URL, which holds the SAS.
+    """
+    http = session or requests
+    full_prefix = f"{prefix.strip('/')}/"
+    where = f"{target.container}/{full_prefix}"
+    base = f"{target.storage_url.rstrip('/')}/{target.container}"
+    names: list[str] = []
+    marker = ""
+    while True:
+        params = {"restype": "container", "comp": "list", "prefix": full_prefix,
+                  "maxresults": "5000"}
+        if marker:
+            params["marker"] = marker
+        url = f"{base}?{urlencode(params, quote_via=quote)}&{target.sas_token.lstrip('?')}"
+        root = ET.fromstring(_list_page(http, url, where).content)
+        names += [b.text for b in root.findall("./Blobs/Blob/Name") if b.text]
+        marker = (root.findtext("NextMarker") or "").strip()
+        if not marker:
+            return names
+
+
+def put_blob_if_absent(target: AzureTarget, blob_name: str, data: bytes | BinaryIO,
+                       content_type: str, session: requests.Session | None = None, *,
+                       content_md5: str | None = None, length: int | None = None) -> bool:
+    """Upload one block blob unless a blob of that name already exists.
+
+    `data` is bytes, or an open binary file that is streamed (then pass `length` and
+    the base64 `content_md5` of its contents). Returns True when uploaded, False when
+    the name was taken, and raises on anything else. `If-None-Match: *` makes the
+    service refuse to overwrite, and Content-MD5 makes it reject a body that arrived
+    damaged or differs from what was hashed. Errors never carry the request URL,
+    which holds the SAS.
+    """
+    http = session or requests
+    url = (f"{target.storage_url.rstrip('/')}/{target.container}/{quote(blob_name, safe='/')}"
+           f"?{target.sas_token.lstrip('?')}")
+    if length == 0:
+        # requests sends an empty stream chunked, which Put Blob refuses (400).
+        data = b""
+    if isinstance(data, (bytes, bytearray)):
+        content_md5 = base64.b64encode(hashlib.md5(data, usedforsecurity=False).digest()).decode()
+        length = len(data)
+    elif content_md5 is None or length is None:
+        raise ValueError("a streamed body needs content_md5 and length")
+    headers = {
+        "x-ms-blob-type": "BlockBlob",
+        "x-ms-version": BLOB_API_VERSION,
+        "If-None-Match": "*",
+        "Content-Type": content_type,
+        "Content-MD5": content_md5,
+        "Content-Length": str(length),
+    }
+    try:
+        resp = http.put(url, data=data, headers=headers, timeout=TIMEOUT)
+    except requests.RequestException as e:
+        raise RuntimeError(f"upload of {blob_name} failed: {type(e).__name__}") from None
+    if resp.status_code == 201:
+        return True
+    code = resp.headers.get("x-ms-error-code", "")
+    # The service answers a taken name with 409 BlobAlreadyExists; 412 is the generic
+    # failed-precondition answer some versions and emulators give instead.
+    if (resp.status_code, code) in {(409, "BlobAlreadyExists"), (412, "ConditionNotMet")}:
+        return False
+    raise RuntimeError(f"upload of {blob_name} failed: HTTP {resp.status_code} {code}".rstrip())
 
 
 def download_blob_json(target: AzureTarget, blob_name: str) -> dict[str, Any] | None:

@@ -42,3 +42,8 @@ objects:
     extra: {}
       # columns: [ID, NAME]        # omit for SELECT *
       # where: "\"DATUM\" >= '2024-01-01'"
+      # files:                     # also copy the files the rows name (README, "File attachments");
+      #                            # needs timestamp_field: null
+      #   base_dir: 'D:\App\Documents'
+      #   path_columns: [FOLDER, FILE_NAME]
+      #   prefix: files/example-ads
