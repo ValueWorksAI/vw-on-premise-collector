@@ -23,5 +23,6 @@ scripts/
 sources/*/
 !sources/_example/
 !sources/_example_mssql/
+!sources/_example_ads/
 !sources/.gitkeep
 .DS_Store
