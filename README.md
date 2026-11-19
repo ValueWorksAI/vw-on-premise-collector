@@ -332,6 +332,32 @@ The orchestrator auto-discovers any folder under `sources/` containing both `con
 
 Objects with a `timestamp_field` run incrementally: each run reads its own latest META file from Azure and only fetches rows changed since the previous upper bound. Objects without a `timestamp_field` full-refresh every run. Because META files are read back from Azure, the SAS token needs **Read + List** in addition to **Create + Write** (container-scoped; no Delete required).
 
+## File attachments
+
+Some tables only point at files, e.g. a document table whose rows name scanned invoices in a folder on the server. Add `extra.files` to such an object and the collector also copies the files its rows name:
+
+```yaml
+  - name: DOCUMENTS
+    endpoint: DOCUMENTS
+    timestamp_field: null
+    partition_scoped: false
+    extra:
+      columns: [ID, FOLDER, FILE_NAME]
+      where: "\"INVOICE_ID\" IS NOT NULL"        # the rows decide which files go
+      files:
+        base_dir: 'D:\App\Documents'             # the folder the row paths are relative to
+        path_columns: [FOLDER, FILE_NAME]        # joined in this order; the last is the file name
+        prefix: files/my-source                  # optional; default <azure.prefix>/_files/<object>
+        max_file_mb: 100                         # optional; larger files are skipped and counted
+```
+
+- **Opt-in and bounded.** Nothing outside `base_dir` is read: absolute paths (`C:\…`, `\\server\…`) and `..` in a row are skipped and counted. The `where` and `columns` of the object decide which rows, and so which files, are in scope. With `columns` set, the path columns must be among them.
+- **New files only.** Each run lists the target prefix once and uploads only the files not there yet: the first run copies everything, later runs only what is new. A blob is never overwritten (`If-None-Match: *`) and never deleted, so a file changed or removed on the host keeps its first copy in storage. Each upload carries Content-MD5, so a damaged body is rejected by the service.
+- **After the tables.** The paths are read back from the object's parquet before the local copy is dropped, but the files themselves are copied at the end of the source's run, so a large first copy cannot delay the tables behind it. Run the first copy by hand during the day if it is large.
+- **In the run report.** The object's entry in `_runs/` gets a `files` block: `named`, `already_in_storage`, `uploaded`, `uploaded_mb`, `missing_on_host`, `too_large`, `failed`, `not_attempted` and `skipped_*`. A file the rows name but the host does not have is counted, not an error. A failed upload (after 3 attempts) marks the object failed, so the run exits `1`, and the next run sends the file again. After 20 failed files the rest is left for the next run.
+- **Permissions.** Needs the SAS's List permission in addition to Create + Write. Without List the copy refuses to start rather than sending everything again.
+- **Choose a prefix outside the table folders** (e.g. `files/<source>`) when the files are many. The default `_files/` sits under the source's prefix: a reader that picks parquet by extension ignores the files there, but still has to page through them when it lists the prefix.
+
 ## Local disk usage
 
 Each object's parquet is uploaded and then deleted as soon as it lands, so peak local disk is **one object**, not one dataset. Size the machine for the largest single object plus headroom, not for the total volume.

@@ -12,7 +12,8 @@ Optional overrides:
 
 The base class owns the run loop: per object, resolve delta bound, fetch each
 partition in batches, combine, write META, upload to Azure, then drop the local
-parquet again before starting the next object.
+parquet again before starting the next object. Objects with `extra.files` also get
+the files their rows point to copied, once every table is done (common/files.py).
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import azure, parquet
+from . import azure, files, parquet
 from .config import ObjectSpec, SourceConfig
 
 log = logging.getLogger(__name__)
@@ -37,6 +38,11 @@ class Source(ABC):
         self.config = config
         self.mode = mode  # "full" | "delta"
         self.collection_start = datetime.now().isoformat()
+        # Parsed up front so a malformed `extra.files` stops the source before any
+        # table is collected rather than after all of them.
+        self._file_specs = {o.name: spec for o in config.objects
+                            if (spec := files.FileSpec.parse(o, config.azure.prefix))}
+        self._pending_files: dict[str, tuple[list[str], dict[str, int]]] = {}
 
     # ----- required -----
     @abstractmethod
@@ -128,6 +134,12 @@ class Source(ABC):
                 # newest file on disk misrepresenting the last successful push.
                 parquet.discard_output(out_dir, obj.name, self.collection_start, "failed")
 
+        # Files last: a first copy of thousands of files must not hold up the tables.
+        for r in results:
+            pending = self._pending_files.pop(r["object"], None)
+            if pending is not None and r["status"] == "ok":
+                self._copy_files(r, *pending)
+
         log.info(f"[{self.config.name}] sweeping local leftovers")
         parquet.cleanup_run(out_dir, [o.name for o in self.config.objects],
                             keep_latest=self.config.keep_local_copy)
@@ -177,6 +189,27 @@ class Source(ABC):
         finally:
             fp.unlink(missing_ok=True)
 
+    def _copy_files(self, result: dict[str, Any], paths: list[str],
+                    skipped: dict[str, int]) -> None:
+        """Copy one object's files and record the counts in its run-report entry.
+
+        The table itself is already uploaded; a failed copy still marks the object
+        failed, so the run exits non-zero and the report says why.
+        """
+        name = result["object"]
+        try:
+            summary = files.copy_missing(self._file_specs[name], self.config.azure,
+                                         paths, skipped, name)
+        except Exception as e:  # noqa: BLE001
+            log.error(f"[{name}] file copy FAILED: {e}")
+            result.update(status="failed", error=f"files: {type(e).__name__}: {e}")
+            return
+        result["files"] = summary
+        if summary["failed"] or summary["not_attempted"]:
+            result.update(status="failed",
+                          error=f"files: {summary['failed']} upload(s) failed, "
+                                f"{summary['not_attempted']} not attempted")
+
     def _run_object(self, obj: ObjectSpec) -> tuple[int, str]:
         lower, upper, refresh_type, is_delta = self.resolve_delta_bound(obj)
         log.info(f"[{obj.name}] mode={refresh_type} lower={lower} upper={upper}")
@@ -216,7 +249,7 @@ class Source(ABC):
             log.info(f"[{obj.name}] records={n}")
 
         # Row count comes from the combine, so nothing is read back to count it.
-        _fp, total = parquet.combine_parts(out_dir, obj.name, self.collection_start)
+        fp, total = parquet.combine_parts(out_dir, obj.name, self.collection_start)
         parquet.discard_parts(out_dir, obj.name)
 
         parquet.write_meta(
@@ -232,6 +265,11 @@ class Source(ABC):
         # object. An upload failure raises, so the object is marked failed and its
         # file is left for the end-of-run sweep.
         self._upload_object(obj)
+        spec = self._file_specs.get(obj.name)
+        if spec is not None:
+            # Only the path columns, after the table is safely up and before the
+            # parquet is dropped. The files themselves follow at the end of run().
+            self._pending_files[obj.name] = files.relative_paths(fp, spec)
         if not self.config.keep_local_copy:
             parquet.discard_output(out_dir, obj.name, self.collection_start, "uploaded")
         return total, refresh_type

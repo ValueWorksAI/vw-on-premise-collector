@@ -139,6 +139,9 @@ receive a small configuration file to drop in place.
   source control and not at ValueWorks.
 - Access to Azure Storage uses a time-limited, revocable SAS token, scoped to a single
   container, with no delete permission.
+- The collector transfers files (scanned invoices, for example) only when the
+  configuration explicitly turns this on for a table, and then only from the folder
+  named there. Files already transferred are not sent again.
 - Every run writes a log file to `C:\logs\vw-on-prem-collector`.
 - The collector can be stopped at any time by disabling the scheduled task. No services
   or background processes are left behind.

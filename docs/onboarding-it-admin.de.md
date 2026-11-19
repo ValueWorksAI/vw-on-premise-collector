@@ -146,6 +146,10 @@ nötig; es kommt lediglich eine kleine Konfigurationsdatei zum Ablegen.
 - Der Zugriff auf den Azure-Storage erfolgt über ein zeitlich begrenztes,
   jederzeit widerrufbares SAS-Token — beschränkt auf genau einen Container,
   ohne Löschrecht.
+- Dateien (z. B. Rechnungsscans) überträgt der Collector nur, wenn das in der
+  Konfiguration für eine Tabelle ausdrücklich eingeschaltet ist, und dann nur aus
+  dem dort genannten Ordner. Bereits übertragene Dateien werden nicht erneut
+  gesendet.
 - Jeder Lauf schreibt ein Logfile nach `C:\logs\vw-on-prem-collector`.
 - Der Collector kann jederzeit gestoppt werden, indem der geplante Task deaktiviert
   wird. Es bleiben keine Dienste oder Hintergrundprozesse zurück.
